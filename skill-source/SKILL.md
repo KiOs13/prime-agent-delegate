@@ -49,8 +49,10 @@ node <skill-dir>\scripts\delegate.mjs --prepare-command `
 7. Run the emitted command with `wsl bash -lc`.
 8. Read `summary.json` and `audit-summary.json` first. Query `events.jsonl` only
    with targeted filters when compact evidence is insufficient.
-9. Inspect the complete diff and rerun every acceptance check independently.
-10. Accept, fix, partially reuse, or reject the result. Commit only after Codex
+9. Prime may run focused checks for its bounded change, but must leave the full
+   integration and regression suites to Codex after the worker session exits.
+10. Inspect the complete diff and rerun every acceptance check independently.
+11. Accept, fix, partially reuse, or reject the result. Commit only after Codex
     verification and user authorization.
 
 ## Modes

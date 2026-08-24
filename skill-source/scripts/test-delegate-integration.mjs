@@ -78,6 +78,10 @@ test("default RPC uses task-parts for large prompts and seals artifacts", () => 
 	assert.equal(summary.transport.mode, "task-parts");
 	assert.equal(summary.transport.handshakeAccepted, true);
 	assert.equal(summary.transport.promptAccepted, true);
+	assert.match(
+		readFileSync(join(outDir, "worker-prompt.md"), "utf8"),
+		/Leave full integration and regression suites to Codex after this worker session exits\./,
+	);
 	const taskManifest = json(join(outDir, "task-parts", "manifest.json"));
 	assert.equal(taskManifest.parts.map((part) => readFileSync(join(outDir, "task-parts", part.name), "utf8")).join(""), prompt);
 	for (const part of taskManifest.parts) assert.equal(sha256(join(outDir, "task-parts", part.name)), part.sha256);

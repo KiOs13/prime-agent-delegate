@@ -448,6 +448,7 @@ const workerRules = [
 	"You are a delegated coding worker. Work only in cwd.",
 	"Do not commit, push, deploy, alter credentials, or perform destructive cleanup.",
 	"Use targeted reads. Do not open worker-prompt.md; it is only an audit artifact.",
+	"Run only focused checks for the bounded change. Leave full integration and regression suites to Codex after this worker session exits.",
 	options.requireChange
 		? `Make the first allowed edit within ${noChangeTimeoutMs} ms or ${noChangeMaxToolCalls} tool calls.`
 		: "Do not edit unless the task explicitly requests it.",
