@@ -1,0 +1,4 @@
+interface:
+  display_name: "Prime Agent Delegate"
+  short_description: "Delegate work to Prime Agent"
+  default_prompt: "Use $prime-agent-delegate to delegate this work to Prime Agent, let it choose its execution strategy, then review and correct the result."

@@ -1,0 +1,910 @@
+#!/usr/bin/env node
+
+import { spawn, spawnSync } from "node:child_process";
+import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+	FAILURE_KIND,
+	STATUS,
+	parseIntegerOption,
+	atomicWriteJson,
+	buildWorkerPromptArgument,
+	classifyChildExit,
+	createHealth,
+	decodeCapturedOutput,
+	decideRestart,
+	evaluateHealthStatus,
+	isLinuxProcessRunningFromStat,
+	readHealth,
+	recordAttemptStart,
+	recordRestarting,
+	recordTerminal,
+	recordValidEvent,
+	shouldStopForNoChange,
+	terminalStatusFor,
+	updateHealth,
+	windowsProcessAlive,
+} from "./delegate-watchdog.mjs";
+
+const DISTRO = "Ubuntu";
+const PRIME_AGENT = "/usr/bin/prime-agent";
+const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
+const DEFAULT_STARTUP_GRACE_MS = 90000;
+const DEFAULT_IDLE_TIMEOUT_MS = 300000;
+const DEFAULT_MAX_INFRA_RESTARTS = 1;
+const DEFAULT_RESTART_DELAY_MS = 5000;
+const DEFAULT_NO_CHANGE_TIMEOUT_MS = 600000;
+const DEFAULT_NO_CHANGE_MAX_TOOL_CALLS = 80;
+const DEFAULT_AUTONOMOUS_MAX_CONTINUATIONS = 3;
+const DEFAULT_AUTONOMOUS_MAX_TURNS = 12;
+const DEFAULT_AUTONOMOUS_MAX_TOKENS = 1000000;
+const INLINE_TASK_MAX_CHARS = 160;
+const TASK_CHUNK_CHARS = 600;
+const TERMINATE_GRACE_MS = 2000;
+const HEALTH_WRITE_INTERVAL_MS = 1000;
+const STDERR_PREVIEW_MAX_BYTES = 4096;
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
+
+function fail(message) {
+	process.stderr.write(`${message}\n`);
+	process.exit(2);
+}
+
+function parseArgs(argv) {
+	const options = { check: false, noTools: false, autonomous: false, autonomousGates: [], allowedChanges: [], fullEvents: false, requireChange: false, wslMode: false, prepareCommand: false };
+	const valueArgs = new Set([
+		"--cwd", "--prompt-file", "--out-dir", "--timeout-ms", "--provider", "--model", "--thinking",
+		"--autonomous-max-continuations", "--autonomous-max-turns", "--autonomous-max-tokens",
+		"--startup-grace-ms", "--idle-timeout-ms", "--max-infra-restarts", "--restart-delay-ms",
+		"--no-change-timeout-ms", "--no-change-max-tool-calls", "--status-dir",
+	]);
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		if (arg === "--check") options.check = true;
+		else if (arg === "--no-tools") options.noTools = true;
+		else if (arg === "--full-events") options.fullEvents = true;
+		else if (arg === "--require-change") options.requireChange = true;
+		else if (arg === "--wsl-mode") options.wslMode = true;
+		else if (arg === "--prepare-command") options.prepareCommand = true;
+		else if (arg === "--autonomous") options.autonomous = true;
+		else if (arg === "--allow-change") {
+			const value = argv[++i];
+			if (!value) fail("Missing value for --allow-change");
+			options.allowedChanges.push(value.replaceAll("\\", "/"));
+		} else if (arg === "--autonomous-gate") {
+			const value = argv[++i];
+			if (!value) fail("Missing value for --autonomous-gate");
+			options.autonomousGates.push(value);
+		} else if (valueArgs.has(arg)) {
+			const value = argv[++i];
+			if (!value) fail(`Missing value for ${arg}`);
+			options[arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = value;
+		} else fail(`Unknown argument: ${arg}`);
+	}
+	return options;
+}
+
+function parseIntOption(value, name, { min = 1, max = Infinity } = {}) {
+	try {
+		return parseIntegerOption(value, { min, max, name });
+	} catch (error) {
+		fail(error.message);
+	}
+}
+
+function runLocalSync(args) {
+	if (WSL_MODE) return spawnSync("bash", ["-lc", args.join(" ")], { encoding: "utf8" });
+	const result = spawnSync("wsl.exe", ["bash", "-lc", args.join(" ")], { encoding: null, windowsHide: true });
+	return { ...result, stdout: decodeCapturedOutput(result.stdout), stderr: decodeCapturedOutput(result.stderr) };
+}
+
+function runWslBashSync(command, options = {}) {
+	if (WSL_MODE) return spawnSync("bash", ["-lc", command], { encoding: "utf8", ...options });
+	const result = spawnSync("wsl.exe", ["bash", "-lc", command], { encoding: null, windowsHide: true, ...options });
+	return { ...result, stdout: decodeCapturedOutput(result.stdout), stderr: decodeCapturedOutput(result.stderr) };
+}
+
+function wslProcessAlive(pid) {
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	const stat = runWslBashSync(`cat /proc/${pid}/stat 2>/dev/null`);
+	return stat.status === 0 && isLinuxProcessRunningFromStat(stat.stdout);
+}
+
+function shellQuote(value) {
+	return `'${String(value).replaceAll("'", `'\"'\"'`)}'`;
+}
+
+function shellJoin(parts) {
+	return parts.map(shellQuote).join(" ");
+}
+
+function windowsPathToWslPath(value) {
+	const match = String(value).match(/^([A-Za-z]):[\\/](.*)$/);
+	if (!match) return value;
+	return `/mnt/${match[1].toLowerCase()}/${match[2].replaceAll("\\", "/")}`;
+}
+
+// --check: version plus daemon/status command reachability. No model inference.
+function checkInstallation() {
+	const versionResult = runLocalSync([PRIME_AGENT + " --version"]);
+	const version = (versionResult.stdout.trim() || versionResult.stderr.trim()).split(/\r?\n/, 1)[0] ?? "";
+	const versionOk = versionResult.status === 0 && version.length > 0;
+
+	const statusResult = runLocalSync([PRIME_AGENT + " status --json"]);
+	let statusServices = null;
+	let statusOk = statusResult.status === 0;
+	try {
+		const parsed = JSON.parse(statusResult.stdout.trim());
+		statusServices = Array.isArray(parsed) ? parsed.length : null;
+	} catch {
+		statusOk = false;
+	}
+
+	const report = {
+		ok: versionOk && statusOk,
+		distro: DISTRO,
+		executable: PRIME_AGENT,
+		version,
+		versionOk,
+		statusCommand: "status --json",
+		statusOk,
+		statusServices,
+		error:
+			!versionOk && versionResult.status !== 0
+				? versionResult.stderr.trim() || undefined
+				: !statusOk
+					? statusResult.stderr.trim() || "prime-agent status --json did not return parseable JSON"
+					: undefined,
+	};
+	process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+	process.exit(report.ok ? 0 : 1);
+}
+
+// --status-dir: read-only health check against a previous run's out-dir.
+// Never starts Prime Agent. Exits 0 only for healthy/non-stale state.
+function runStatusCommand(statusDir) {
+	const healthPath = join(statusDir, "health.json");
+	if (!existsSync(healthPath)) {
+		process.stdout.write(`${JSON.stringify({ healthy: false, active: false, error: "health.json not found", healthPath }, null, 2)}\n`);
+		process.exit(1);
+	}
+	const health = readHealth(healthPath);
+	if (!health) {
+		process.stdout.write(`${JSON.stringify({ healthy: false, active: false, error: "health.json missing or invalid JSON", healthPath }, null, 2)}\n`);
+		process.exit(1);
+	}
+	const isProcessAlive = health.processHost === "wsl" ? wslProcessAlive : windowsProcessAlive;
+	const result = evaluateHealthStatus(health, { now: Date.now(), isProcessAlive });
+	process.stdout.write(`${JSON.stringify(
+		{ healthy: result.healthy, active: result.active, status: result.status, stale: result.stale, reason: result.reason, heartbeatAgeMs: result.heartbeatAgeMs, thresholdMs: result.thresholdMs, childPid: result.childPid, pidAlive: result.pidAlive, healthPath },
+		null,
+		2
+	)}\n`);
+	process.exit(result.exitCode);
+}
+
+function requireAbsoluteExistingPath(value, name) {
+	if (!value || (!isAbsolute(value) && !(WSL_MODE && value.startsWith("/")))) fail(`${name} must be an absolute path`);
+	try {
+		return realpathSync(value);
+	} catch (error) {
+		fail(`${name} is not accessible: ${error.message}`);
+	}
+}
+
+function toWslPath(windowsPath) {
+	if (WSL_MODE) {
+		if (windowsPath.startsWith("/")) return windowsPath;
+		return windowsPathToWslPath(windowsPath);
+	}
+	const result = runLocalSync(["wslpath", "-a", "-u", windowsPath.replaceAll("\\", "/")]);
+	if (result.status !== 0) fail(`wslpath failed: ${result.stderr.trim()}`);
+	return result.stdout.trim();
+}
+
+// Returns { environment, mode, baseline }. The git status preflight doubles as
+// the baseline capture that restarts are compared against.
+function resolveWslGitContext(cwd, wslCwd) {
+	const dotGit = join(cwd, ".git");
+	let environment = [];
+	let mode = "native";
+	try {
+		if (lstatSync(dotGit).isFile()) {
+			const match = readFileSync(dotGit, "utf8").trim().match(/^gitdir:\s*(.+)$/i);
+			if (!match) fail(`Unsupported linked worktree metadata: ${dotGit}`);
+			const windowsGitDir = isAbsolute(match[1]) || /^[A-Za-z]:[\\/]/.test(match[1]) ? match[1] : resolve(cwd, match[1]);
+			const wslGitDir = toWslPath(windowsGitDir);
+			environment = [`GIT_DIR=${wslGitDir}`, `GIT_WORK_TREE=${wslCwd}`];
+			mode = "linked-worktree";
+		}
+	} catch (error) {
+		if (error?.code !== "ENOENT") fail(`Cannot inspect Git metadata: ${error.message}`);
+	}
+	const command = environment.length > 0
+		? ["env", ...environment, "git", "status", "--porcelain"]
+		: ["git", "status", "--porcelain"];
+	const cmd = `cd ${shellQuote(wslCwd)} && ${shellJoin(command)}`;
+	const result = runWslBashSync(cmd);
+	if (result.status !== 0) {
+		fail(`WSL Git preflight failed for ${cwd}: ${(result.stderr || result.stdout).trim()}`);
+	}
+	return { environment, mode, baseline: result.stdout };
+}
+
+function assistantText(message) {
+	if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return "";
+	return message.content
+		.filter((part) => part?.type === "text" && typeof part.text === "string")
+		.map((part) => part.text)
+		.join("");
+}
+
+function escapeExtendedRegex(value) {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function sleepSync(ms) {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function linuxProcessAlive(pid) {
+	const stat = spawnSync("cat", [`/proc/${pid}/stat`], { encoding: "utf8" });
+	return stat.status === 0 && isLinuxProcessRunningFromStat(stat.stdout);
+}
+
+function terminateProcessTree(pid) {
+// Terminate only the exact spawned wsl.exe process tree: normal termination
+// first, then a bounded grace, then exact-PID taskkill /T /F if still alive.
+	if (WSL_MODE) {
+		try { spawnSync("kill", ["-TERM", String(pid)], { encoding: "utf8" }); } catch { /* ignore */ }
+		const deadline = Date.now() + TERMINATE_GRACE_MS;
+		while (Date.now() < deadline) {
+			if (!linuxProcessAlive(pid)) return "terminated";
+			sleepSync(100);
+		}
+		try { spawnSync("kill", ["-9", String(pid)], { encoding: "utf8" }); } catch { /* ignore */ }
+		const forceDeadline = Date.now() + TERMINATE_GRACE_MS;
+		while (Date.now() < forceDeadline) {
+			if (!linuxProcessAlive(pid)) return "force_terminated";
+			sleepSync(100);
+		}
+		return "termination_failed";
+	}
+	if (!windowsProcessAlive(pid)) return "not_running";
+	spawnSync("taskkill.exe", ["/PID", String(pid), "/T"], { windowsHide: true, encoding: "utf8" });
+	const deadline = Date.now() + TERMINATE_GRACE_MS;
+	while (Date.now() < deadline) {
+		if (!windowsProcessAlive(pid)) return "terminated";
+		sleepSync(100);
+	}
+	if (windowsProcessAlive(pid)) {
+		spawnSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, encoding: "utf8" });
+		const forceDeadline = Date.now() + TERMINATE_GRACE_MS;
+		while (Date.now() < forceDeadline) {
+			if (!windowsProcessAlive(pid)) return "force_terminated";
+			sleepSync(100);
+		}
+		return "termination_failed";
+	}
+	return "terminated";
+}
+
+const options = parseArgs(process.argv.slice(2));
+const WSL_MODE = options.wslMode || process.platform === "linux";
+if (options.check) checkInstallation();
+if (options.statusDir) {
+	if (!isAbsolute(options.statusDir)) fail("--status-dir must be an absolute Windows path");
+	runStatusCommand(options.statusDir);
+}
+if ((options.requireChange || options.allowedChanges.length > 0) && !options.autonomous) {
+	fail("--require-change and --allow-change require --autonomous");
+}
+if (options.autonomous && options.autonomousGates.length === 0) {
+	fail("--autonomous requires at least one explicit --autonomous-gate");
+}
+
+if (options.prepareCommand) {
+	const parts = ["/usr/bin/node", windowsPathToWslPath(join(SCRIPT_DIR, "delegate.mjs")), "--wsl-mode"];
+	if (options.cwd) parts.push("--cwd", windowsPathToWslPath(options.cwd));
+	if (options.promptFile) parts.push("--prompt-file", windowsPathToWslPath(options.promptFile));
+	if (options.outDir) parts.push("--out-dir", windowsPathToWslPath(options.outDir));
+	if (options.timeoutMs) parts.push("--timeout-ms", options.timeoutMs);
+	if (options.startupGraceMs) parts.push("--startup-grace-ms", options.startupGraceMs);
+	if (options.idleTimeoutMs) parts.push("--idle-timeout-ms", options.idleTimeoutMs);
+	if (options.maxInfraRestarts) parts.push("--max-infra-restarts", options.maxInfraRestarts);
+	if (options.restartDelayMs) parts.push("--restart-delay-ms", options.restartDelayMs);
+	if (options.noChangeTimeoutMs) parts.push("--no-change-timeout-ms", options.noChangeTimeoutMs);
+	if (options.noChangeMaxToolCalls) parts.push("--no-change-max-tool-calls", options.noChangeMaxToolCalls);
+	if (options.provider) parts.push("--provider", options.provider);
+	if (options.model) parts.push("--model", options.model);
+	if (options.thinking) parts.push("--thinking", options.thinking);
+	if (options.noTools) parts.push("--no-tools");
+	if (options.fullEvents) parts.push("--full-events");
+	if (options.requireChange) parts.push("--require-change");
+	if (options.autonomous) parts.push("--autonomous");
+	if (options.autonomousMaxContinuations) parts.push("--autonomous-max-continuations", options.autonomousMaxContinuations);
+	if (options.autonomousMaxTurns) parts.push("--autonomous-max-turns", options.autonomousMaxTurns);
+	if (options.autonomousMaxTokens) parts.push("--autonomous-max-tokens", options.autonomousMaxTokens);
+	for (const g of options.autonomousGates) parts.push("--autonomous-gate", g);
+	for (const c of options.allowedChanges) parts.push("--allow-change", c);
+	process.stdout.write(shellJoin(parts) + "\n");
+	process.exit(0);
+}
+
+const cwd = requireAbsoluteExistingPath(options.cwd, "--cwd");
+const promptFile = requireAbsoluteExistingPath(options.promptFile, "--prompt-file");
+const timeoutMs = parseIntOption(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, "--timeout-ms", { min: 1 });
+const startupGraceMs = parseIntOption(options.startupGraceMs ?? DEFAULT_STARTUP_GRACE_MS, "--startup-grace-ms", { min: 1 });
+const idleTimeoutMs = parseIntOption(options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS, "--idle-timeout-ms", { min: 1 });
+const maxInfraRestarts = parseIntOption(options.maxInfraRestarts ?? DEFAULT_MAX_INFRA_RESTARTS, "--max-infra-restarts", { min: 0, max: 3 });
+const restartDelayMs = parseIntOption(options.restartDelayMs ?? DEFAULT_RESTART_DELAY_MS, "--restart-delay-ms", { min: 0 });
+const noChangeTimeoutMs = parseIntOption(
+	options.noChangeTimeoutMs ?? DEFAULT_NO_CHANGE_TIMEOUT_MS,
+	"--no-change-timeout-ms",
+	{ min: 1 },
+);
+const noChangeMaxToolCalls = parseIntOption(
+	options.noChangeMaxToolCalls ?? DEFAULT_NO_CHANGE_MAX_TOOL_CALLS,
+	"--no-change-max-tool-calls",
+	{ min: 1 },
+);
+const autonomousMaxContinuations = parseIntOption(options.autonomousMaxContinuations ?? DEFAULT_AUTONOMOUS_MAX_CONTINUATIONS, "--autonomous-max-continuations", { min: 1 });
+const autonomousMaxTurns = parseIntOption(options.autonomousMaxTurns ?? DEFAULT_AUTONOMOUS_MAX_TURNS, "--autonomous-max-turns", { min: 1 });
+const autonomousMaxTokens = parseIntOption(options.autonomousMaxTokens ?? DEFAULT_AUTONOMOUS_MAX_TOKENS, "--autonomous-max-tokens", { min: 1 });
+
+const prompt = readFileSync(promptFile, "utf8").trim();
+if (!prompt) fail("--prompt-file is empty");
+
+const outDir = resolve(options.outDir ?? join(cwd, ".codex", "prime-agent-runs", new Date().toISOString().replaceAll(":", "-")));
+mkdirSync(outDir, { recursive: true });
+
+const eventsPath = join(outDir, "events.jsonl");
+const stderrPath = join(outDir, "stderr.log");
+const summaryPath = join(outDir, "summary.json");
+const auditSummaryPath = join(outDir, "audit-summary.json");
+const workerPromptPath = join(outDir, "worker-prompt.md");
+const healthPath = join(outDir, "health.json");
+const runtimeBinDir = join(outDir, "runtime-bin");
+const events = createWriteStream(eventsPath, { encoding: "utf8" });
+const errors = createWriteStream(stderrPath, { encoding: "utf8" });
+const wslCwd = toWslPath(cwd);
+const gitContext = resolveWslGitContext(cwd, wslCwd);
+if (options.requireChange && gitContext.baseline !== "") {
+	fail("--require-change requires a clean delegated worktree");
+}
+
+const workerRules = [
+	"You are a delegated coding worker. Work only in cwd.",
+	"Do not commit, push, deploy, alter credentials, or perform destructive cleanup.",
+	"Use targeted reads. Do not open worker-prompt.md; it is only an audit artifact.",
+	options.requireChange
+		? `Make the first allowed edit within ${noChangeTimeoutMs} ms or ${noChangeMaxToolCalls} tool calls.`
+		: "Do not edit unless the task explicitly requests it.",
+	options.autonomous ? "The host runs final gates. Return changed files, checks, and blockers." : "Return one concise final report.",
+];
+const auditTaskContract = [...workerRules, "", "TASK:", prompt].join("\n");
+writeFileSync(workerPromptPath, `${auditTaskContract}\n`, "utf8");
+
+let primeTask;
+if (prompt.length <= INLINE_TASK_MAX_CHARS) {
+	primeTask = [...workerRules, "", "TASK:", prompt].join("\n");
+} else {
+	const taskPartsDir = join(outDir, "task-parts");
+	mkdirSync(taskPartsDir, { recursive: true });
+	for (let offset = 0, part = 1; offset < prompt.length; offset += TASK_CHUNK_CHARS, part++) {
+		const name = `part-${String(part).padStart(3, "0")}.txt`;
+		writeFileSync(join(taskPartsDir, name), prompt.slice(offset, offset + TASK_CHUNK_CHARS), "utf8");
+	}
+	const wslTaskPartsDir = toWslPath(taskPartsDir);
+	primeTask = [
+		...workerRules,
+		"",
+		`TASK DETAILS: ${wslTaskPartsDir}/part-*.txt`,
+		"Read each part exactly once, one file per tool call, in lexical order. Never print multiple parts together.",
+		"After the last part, implement the task immediately.",
+	].join("\n");
+}
+
+function buildRuntimeEnvironment() {
+	if (!WSL_MODE) return [];
+	const environment = [];
+	const windowsPowerShell = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+	const nativePowerShell = spawnSync("bash", ["-lc", "command -v powershell >/dev/null 2>&1"], { encoding: "utf8" });
+	if (nativePowerShell.status !== 0 && existsSync(windowsPowerShell)) {
+		mkdirSync(runtimeBinDir, { recursive: true });
+		const wrapperPath = join(runtimeBinDir, "powershell");
+		writeFileSync(wrapperPath, `#!/bin/sh\nexec '${windowsPowerShell}' "$@"\n`, "utf8");
+		chmodSync(wrapperPath, 0o755);
+		environment.push(`PATH=${runtimeBinDir}:${process.env.PATH ?? ""}`);
+	}
+	return environment;
+}
+
+const runtimeEnvironment = buildRuntimeEnvironment();
+
+function buildPrimeArgs() {
+	const primeArgs = [PRIME_AGENT, "--mode", "json", "--no-session", "--cwd", wslCwd];
+	if (options.noTools) primeArgs.push("--no-tools");
+	if (options.provider) primeArgs.push("--provider", options.provider);
+	if (options.model) primeArgs.push("--model", options.model);
+	if (options.thinking) primeArgs.push("--thinking", options.thinking);
+	if (options.autonomous) {
+		primeArgs.push("--autonomous");
+		primeArgs.push("--autonomous-max-continuations", String(autonomousMaxContinuations));
+		primeArgs.push("--autonomous-max-turns", String(autonomousMaxTurns));
+		primeArgs.push("--autonomous-max-tokens", String(autonomousMaxTokens));
+		primeArgs.push("--autonomous-timeout-ms", String(timeoutMs));
+		for (const gate of options.autonomousGates) primeArgs.push("--autonomous-gate", gate);
+		if (options.requireChange) {
+			primeArgs.push("--autonomous-gate", "test -n \"$(git status --porcelain)\"");
+		}
+		if (options.allowedChanges.length > 0) {
+			const allowedPattern = options.allowedChanges.map(escapeExtendedRegex).join("|");
+			primeArgs.push("--autonomous-gate", `test -z "$(git status --porcelain | cut -c4- | grep -Ev '^(${allowedPattern})$')"`);
+		}
+	}
+	const promptArgument = buildWorkerPromptArgument({ workerPrompt: primeTask });
+	primeArgs.push("--", promptArgument);
+	const environment = [...gitContext.environment, ...runtimeEnvironment];
+	return environment.length > 0 ? ["env", ...environment, ...primeArgs] : primeArgs;
+}
+
+const startedAt = new Date().toISOString();
+const overallDeadlineMs = Date.now() + timeoutMs;
+let health = createHealth({
+	startedAt,
+	startupGraceMs,
+	idleTimeoutMs,
+	noChangeTimeoutMs,
+	noChangeMaxToolCalls,
+	restartDelayMs,
+	overallTimeoutMs: timeoutMs,
+	maxInfraRestarts,
+	processHost: WSL_MODE ? "wsl" : "windows",
+});
+atomicWriteJson(healthPath, health);
+
+let attempt = 0;
+let restartCount = 0;
+let restartReasons = [];
+const attempts = [];
+let finalized = false;
+let finalExitCode = 1;
+let terminalStatus = null;
+let terminalReason = null;
+
+let child = null;
+let stdoutBuffer = "";
+let finalText = "";
+let eventCount = 0;
+let persistedEventCount = 0;
+let droppedStreamingEventCount = 0;
+let parseErrors = 0;
+let attemptEventCount = 0;
+let attemptStderrBytes = 0;
+let attemptStderrPreview = "";
+let firstEventSeen = false;
+let attemptClosed = true;
+let pendingCondition = null;
+let timedOut = false;
+let spawnFailed = false;
+
+let startupTimer = null;
+let idleTimer = null;
+let noChangeTimer = null;
+let overallTimer = null;
+let healthWriteTimer = null;
+let lastChildExitCode = null;
+let lastChildSignal = null;
+let forcedTerminalReason = null;
+
+function flushHealth() {
+	if (healthWriteTimer) {
+		clearTimeout(healthWriteTimer);
+		healthWriteTimer = null;
+	}
+	atomicWriteJson(healthPath, health);
+}
+
+function scheduleHealthWrite() {
+	if (healthWriteTimer || finalized) return;
+	healthWriteTimer = setTimeout(() => {
+		healthWriteTimer = null;
+		atomicWriteJson(healthPath, health);
+	}, HEALTH_WRITE_INTERVAL_MS);
+}
+
+function shouldPersistEvent(event) {
+	return options.fullEvents || !["message_update", "tool_execution_update"].includes(event?.type);
+}
+
+function processEventLine(rawLine) {
+	const line = rawLine.trim();
+	if (!line) return;
+	try {
+		const event = JSON.parse(line);
+		eventCount++;
+		attemptEventCount++;
+		if (event.type === "message_end") finalText = assistantText(event.message) || finalText;
+		if (event.type === "agent_end" && Array.isArray(event.messages)) {
+			for (const message of event.messages) finalText = assistantText(message) || finalText;
+		}
+		if (shouldPersistEvent(event)) {
+			events.write(`${line}\n`);
+			persistedEventCount++;
+		} else {
+			droppedStreamingEventCount++;
+		}
+		onValidEvent(event);
+	} catch {
+		parseErrors++;
+		events.write(`${JSON.stringify({ type: "parse_error", preview: line.slice(0, 500) })}\n`);
+		persistedEventCount++;
+	}
+}
+
+function onValidEvent(event) {
+	if (forcedTerminalReason) return;
+	const wasFirstEvent = !firstEventSeen;
+	firstEventSeen = true;
+	const now = Date.now();
+	const toolCall = event?.type === "tool_execution_start";
+	health = recordValidEvent(health, { now, toolCall });
+	if (options.requireChange && !health.changeDetectedAt && toolCall) {
+		const porcelain = currentGitPorcelain();
+		if (!porcelain.ok) {
+			forcedTerminalReason = porcelain.error;
+			terminateChild(porcelain.error);
+			return;
+		}
+		if (porcelain.value !== gitContext.baseline) {
+			health = updateHealth(health, { changeDetectedAt: new Date(now).toISOString(), lastReason: "change_detected", now });
+			clearTimeout(noChangeTimer);
+			noChangeTimer = null;
+		} else if (shouldStopForNoChange({
+			requireChange: true,
+			elapsedMs: now - Date.parse(health.attemptStartedAt),
+			timeoutMs: noChangeTimeoutMs,
+			toolCallCount: health.attemptToolCallCount,
+			maxToolCalls: noChangeMaxToolCalls,
+		})) {
+			pendingCondition = FAILURE_KIND.NO_CHANGE_PROGRESS;
+			terminateChild(FAILURE_KIND.NO_CHANGE_PROGRESS);
+			return;
+		}
+	}
+	if (wasFirstEvent) flushHealth();
+	else scheduleHealthWrite();
+	if (startupTimer) {
+		clearTimeout(startupTimer);
+		startupTimer = null;
+	}
+	if (idleTimer) clearTimeout(idleTimer);
+	idleTimer = setTimeout(onIdleTimeout, idleTimeoutMs);
+}
+
+function appendSyntheticEvent(event) {
+	const line = { type: "watchdog_event", ...event, attempt, at: new Date().toISOString() };
+	events.write(`${JSON.stringify(line)}\n`);
+	persistedEventCount++;
+	return line;
+}
+
+function writeHealthWithReason(reason) {
+	health = updateHealth(health, { lastReason: reason, now: Date.now() });
+	flushHealth();
+}
+
+function terminateChild(reason) {
+	writeHealthWithReason(reason);
+	clearTimeout(startupTimer);
+	startupTimer = null;
+	clearTimeout(idleTimer);
+	idleTimer = null;
+	clearTimeout(noChangeTimer);
+	noChangeTimer = null;
+	const pid = child?.pid;
+	if (!pid) return;
+	const result = terminateProcessTree(pid);
+	appendSyntheticEvent({ kind: "terminate", reason, result });
+	if (result === "termination_failed") {
+		pendingCondition = null;
+		forcedTerminalReason = "process_termination_failed";
+		health = recordTerminal(health, { status: STATUS.FAILED, reason: forcedTerminalReason });
+		flushHealth();
+	}
+}
+
+function onStartupTimeout() {
+	if (finalized || attemptClosed || firstEventSeen) return;
+	pendingCondition = FAILURE_KIND.STARTUP_TIMEOUT;
+	terminateChild("startup_timeout");
+}
+
+function onIdleTimeout() {
+	if (finalized || attemptClosed) return;
+	pendingCondition = FAILURE_KIND.IDLE_TIMEOUT;
+	terminateChild("idle_timeout");
+}
+
+function onNoChangeTimeout() {
+	if (finalized || attemptClosed || !options.requireChange || health.changeDetectedAt) return;
+	const porcelain = currentGitPorcelain();
+	if (!porcelain.ok) {
+		forcedTerminalReason = porcelain.error;
+		terminateChild(porcelain.error);
+		return;
+	}
+	if (porcelain.value !== gitContext.baseline) {
+		health = updateHealth(health, {
+			changeDetectedAt: new Date().toISOString(),
+			lastReason: "change_detected",
+			now: Date.now(),
+		});
+		noChangeTimer = null;
+		flushHealth();
+		return;
+	}
+	pendingCondition = FAILURE_KIND.NO_CHANGE_PROGRESS;
+	terminateChild(FAILURE_KIND.NO_CHANGE_PROGRESS);
+}
+
+function onOverallTimeout() {
+	if (finalized) return;
+	timedOut = true;
+	pendingCondition = null;
+	if (child && !attemptClosed) {
+		terminateChild("overall_timeout");
+	} else {
+		// No child in flight (e.g. waiting out a restart delay): finalize now.
+		finalize(STATUS.TIMED_OUT, "overall_timeout", "overall_deadline_exhausted");
+	}
+}
+
+function spawnAttempt() {
+	attempt++;
+	attemptEventCount = 0;
+	attemptStderrBytes = 0;
+	attemptStderrPreview = "";
+	firstEventSeen = false;
+	attemptClosed = false;
+	pendingCondition = null;
+	timedOut = false;
+	spawnFailed = false;
+	forcedTerminalReason = null;
+	stdoutBuffer = "";
+	const attemptStartedAt = new Date().toISOString();
+	attempts.push({ attempt, startedAt: attemptStartedAt });
+
+	const primeCmd = shellJoin(buildPrimeArgs());
+	const fullCmd = `cd ${shellQuote(wslCwd)} && ${primeCmd}`;
+	child = WSL_MODE ? spawn("bash", ["-lc", fullCmd], { stdio: ["ignore", "pipe", "pipe"] }) : spawn("wsl.exe", ["bash", "-lc", fullCmd], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+
+	health = recordAttemptStart(health, { attempt, childPid: child.pid, now: Date.now() });
+	health.attemptStartedAt = attemptStartedAt;
+	flushHealth();
+
+	child.stdout.setEncoding("utf8");
+	child.stdout.on("data", (chunk) => {
+		stdoutBuffer += chunk;
+		let newline = stdoutBuffer.indexOf("\n");
+		while (newline !== -1) {
+			processEventLine(stdoutBuffer.slice(0, newline));
+			stdoutBuffer = stdoutBuffer.slice(newline + 1);
+			newline = stdoutBuffer.indexOf("\n");
+		}
+	});
+	child.stderr.on("data", (chunk) => {
+		const text = String(chunk);
+		attemptStderrBytes += Buffer.byteLength(text, "utf8");
+		if (attemptStderrPreview.length < STDERR_PREVIEW_MAX_BYTES) {
+			attemptStderrPreview = (attemptStderrPreview + text).slice(0, STDERR_PREVIEW_MAX_BYTES);
+		}
+	});
+	child.stderr.pipe(errors, { end: false });
+	child.on("error", (error) => {
+		errors.write(`${error.stack || error.message}\n`);
+		spawnFailed = true;
+		attemptStderrBytes += Buffer.byteLength(error.stack || error.message, "utf8");
+		if (!attemptClosed) onChildClose(null, null);
+	});
+	child.on("close", (code, signal) => {
+		if (!attemptClosed) onChildClose(code, signal);
+	});
+
+	startupTimer = setTimeout(onStartupTimeout, startupGraceMs);
+	if (options.requireChange) noChangeTimer = setTimeout(onNoChangeTimeout, noChangeTimeoutMs);
+	if (!overallTimer) overallTimer = setTimeout(onOverallTimeout, Math.max(0, overallDeadlineMs - Date.now()));
+	process.stdout.write(`${JSON.stringify({ type: "attempt_start", attempt, childPid: child.pid, startedAt: attemptStartedAt })}\n`);
+}
+
+function currentGitPorcelain() {
+	const command = gitContext.environment.length > 0
+		? ["env", ...gitContext.environment, "git", "status", "--porcelain"]
+		: ["git", "status", "--porcelain"];
+	const cmd = `cd ${shellQuote(wslCwd)} && ${shellJoin(command)}`;
+	const result = runWslBashSync(cmd, { timeout: 60000 });
+	if (result.status !== 0 || result.error) {
+		return { ok: false, error: "git_status_failed" };
+	}
+	return { ok: true, value: result.stdout };
+}
+
+function onChildClose(code, signal) {
+	if (finalized || attemptClosed) return;
+	attemptClosed = true;
+	clearTimeout(startupTimer);
+	startupTimer = null;
+	clearTimeout(idleTimer);
+	idleTimer = null;
+	clearTimeout(noChangeTimer);
+	noChangeTimer = null;
+	processEventLine(stdoutBuffer);
+	stdoutBuffer = "";
+	// The trailing flush may have re-armed the idle timer; drop it now.
+	clearTimeout(idleTimer);
+	idleTimer = null;
+	clearTimeout(noChangeTimer);
+	noChangeTimer = null;
+
+	const classification = classifyChildExit({
+		exitCode: code,
+		signal,
+		attemptEventCount,
+		stderrPreview: attemptStderrPreview,
+		watchdogCondition: pendingCondition,
+		timedOut,
+		spawnFailed,
+	});
+
+	attempts[attempts.length - 1] = {
+		...attempts[attempts.length - 1],
+		finishedAt: new Date().toISOString(),
+		exitCode: code,
+		signal,
+		eventCount: attemptEventCount,
+		kind: classification.kind,
+		reason: classification.reason,
+	};
+	lastChildExitCode = code;
+	lastChildSignal = signal;
+
+	appendSyntheticEvent({ kind: "attempt_end", outcome: classification.kind, reason: classification.reason, exitCode: code });
+	if (forcedTerminalReason) {
+		finalize(STATUS.FAILED, forcedTerminalReason, forcedTerminalReason);
+		return;
+	}
+
+	if (classification.kind === "completed" || classification.kind === "timed_out" || classification.kind === "failed" || classification.kind === "config_error") {
+		finalize(classification.terminalStatus, classification.reason, `${classification.kind}_not_restartable`);
+		return;
+	}
+
+	// Infrastructure failure: compare the worktree against the attempt-1 baseline.
+	const porcelainResult = currentGitPorcelain();
+	if (!porcelainResult.ok) {
+		finalize(STATUS.FAILED, porcelainResult.error, "git_status_failed");
+		return;
+	}
+	const porcelain = porcelainResult.value;
+	const worktreeMatchesBaseline = porcelain === gitContext.baseline;
+	const restartDecision = decideRestart({
+		kind: classification.kind,
+		worktreeMatchesBaseline,
+		restartCount,
+		maxInfraRestarts,
+		now: Date.now(),
+		overallDeadlineMs,
+		restartDelayMs,
+		startupGraceMs,
+	});
+
+	if (restartDecision.restart) {
+		restartCount++;
+		restartReasons.push({ attempt, kind: classification.kind, reason: classification.reason });
+		health = recordRestarting(health, { reason: `restart_after_${classification.kind}`, restartCount });
+		flushHealth();
+		appendSyntheticEvent({ kind: "restart", reason: classification.reason, restartCount, maxInfraRestarts });
+		process.stdout.write(`${JSON.stringify({ type: "restart_scheduled", attempt, restartCount, reason: classification.reason, delayMs: restartDelayMs })}\n`);
+		setTimeout(() => {
+			if (!finalized) spawnAttempt();
+		}, restartDelayMs);
+		return;
+	}
+
+	const terminal = terminalStatusFor({ kind: classification.kind, restartDecision });
+	const worktreeDiff = worktreeMatchesBaseline ? undefined : porcelain;
+	finalize(terminal, `${classification.kind}:${restartDecision.reason}`, restartDecision.reason, worktreeDiff);
+}
+
+function finalize(status, reason, decisionReason, worktreeDiff) {
+	if (finalized) return;
+	finalized = true;
+	attemptClosed = true;
+	clearTimeout(startupTimer);
+	startupTimer = null;
+	clearTimeout(idleTimer);
+	idleTimer = null;
+	clearTimeout(noChangeTimer);
+	noChangeTimer = null;
+	clearTimeout(overallTimer);
+	overallTimer = null;
+	clearTimeout(healthWriteTimer);
+	healthWriteTimer = null;
+	processEventLine(stdoutBuffer);
+	stdoutBuffer = "";
+	clearTimeout(idleTimer);
+	idleTimer = null;
+
+	terminalStatus = status;
+	terminalReason = reason;
+	finalExitCode = status === STATUS.COMPLETED ? 0 : 1;
+	health = recordTerminal(health, { status, reason });
+	flushHealth();
+
+	const finishedAt = new Date().toISOString();
+	const summary = {
+		status,
+		terminalReason,
+		decisionReason,
+		exitCode: lastChildExitCode,
+		signal: lastChildSignal,
+		startedAt,
+		finishedAt,
+		timeoutMs,
+		startupGraceMs,
+		idleTimeoutMs,
+		noChangeTimeoutMs,
+		noChangeMaxToolCalls,
+		maxInfraRestarts,
+		restartDelayMs,
+		autonomous: options.autonomous,
+		autonomousMaxContinuations: options.autonomous ? autonomousMaxContinuations : null,
+		autonomousMaxTurns: options.autonomous ? autonomousMaxTurns : null,
+		autonomousMaxTokens: options.autonomous ? autonomousMaxTokens : null,
+		autonomousGateCount: options.autonomousGates.length,
+		attemptCount: attempt,
+		restartCount,
+		restartReasons,
+		attempts,
+		cwd,
+		wslCwd,
+		gitContextMode: gitContext.mode,
+		promptFile,
+		eventCaptureMode: options.fullEvents ? "full" : "compact",
+		requireChange: options.requireChange,
+		allowedChanges: options.allowedChanges,
+		eventCount,
+		persistedEventCount,
+		droppedStreamingEventCount,
+		parseErrors,
+		finalText,
+		worktreeDiff,
+		healthPath,
+		artifacts: { eventsPath, stderrPath, summaryPath, auditSummaryPath, workerPromptPath, healthPath },
+	};
+	writeFileSync(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
+	let pendingStreams = 2;
+	const finish = () => {
+		pendingStreams--;
+		if (pendingStreams !== 0) return;
+		// Both streams flushed: audit the complete accumulated events/stderr.
+		const audit = spawnSync(process.execPath, [
+			join(SCRIPT_DIR, "summarize-events.mjs"),
+			"--events", eventsPath,
+			"--summary", summaryPath,
+			"--stderr", stderrPath,
+			"--output", auditSummaryPath,
+		], { encoding: "utf8", windowsHide: true });
+		summary.auditSummaryStatus = audit.status === 0 ? "created" : "failed";
+		if (audit.status !== 0) summary.auditSummaryError = (audit.stderr || audit.stdout).trim().slice(0, 1000);
+		writeFileSync(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
+		process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+		process.exit(finalExitCode);
+	};
+	events.end(finish);
+	errors.end(finish);
+}
+
+spawnAttempt();

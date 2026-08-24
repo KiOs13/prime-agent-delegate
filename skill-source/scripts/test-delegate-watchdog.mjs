@@ -1,0 +1,438 @@
+#!/usr/bin/env node
+
+// scripts/test-delegate-watchdog.mjs
+//
+// Dependency-free unit tests for the delegate watchdog decisions and health
+// helpers. No Prime Agent, WSL, network, or credentials are touched.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+	FAILURE_KIND,
+	SCHEMA_VERSION,
+	STATUS,
+	atomicWriteJson,
+	buildWorkerPromptArgument,
+	classifyChildExit,
+	createHealth,
+	decodeCapturedOutput,
+	decideRestart,
+	evaluateHealthStatus,
+	healthHeartbeatAge,
+	isInfraFailure,
+	isKnownConfigurationError,
+	isLinuxProcessRunningFromStat,
+	isTerminal,
+	parseIntegerOption,
+	primeFailureReason,
+	readHealth,
+	recordAttemptStart,
+	recordRestarting,
+	recordTerminal,
+	recordValidEvent,
+	shouldStopForNoChange,
+	terminalStatusFor,
+} from "./delegate-watchdog.mjs";
+
+const ALIVE_PID = 4242;
+const dead = () => false;
+const aliveOnly = (pid) => pid === ALIVE_PID;
+
+const NOW = Date.UTC(2026, 0, 1, 12, 0, 0);
+const FUTURE = NOW + 24 * 60 * 60 * 1000;
+
+function baseHealth(overrides = {}) {
+	return createHealth({
+		attempt: 1,
+		childPid: ALIVE_PID,
+		startupGraceMs: 90000,
+		idleTimeoutMs: 300000,
+		restartDelayMs: 5000,
+		overallTimeoutMs: 1800000,
+		now: NOW,
+		...overrides,
+	});
+}
+
+function restartArgs(overrides = {}) {
+	return {
+		kind: FAILURE_KIND.STARTUP_TIMEOUT,
+		worktreeMatchesBaseline: true,
+		restartCount: 0,
+		maxInfraRestarts: 1,
+		now: NOW,
+		overallDeadlineMs: FUTURE,
+		restartDelayMs: 5000,
+		startupGraceMs: 90000,
+		...overrides,
+	};
+}
+
+test("health schema and derived booleans", () => {
+	const health = baseHealth();
+	assert.equal(health.schemaVersion, SCHEMA_VERSION);
+	assert.equal(health.status, STATUS.STARTING);
+	assert.equal(health.healthy, true);
+	assert.equal(health.active, true);
+	assert.equal(health.attempt, 1);
+	assert.equal(health.restartCount, 0);
+	assert.equal(health.maxInfraRestarts, 1);
+	assert.equal(health.childPid, ALIVE_PID);
+	assert.equal(health.startupGraceMs, 90000);
+	assert.equal(health.idleTimeoutMs, 300000);
+	assert.equal(health.overallTimeoutMs, 1800000);
+	assert.equal(health.firstEventAt, null);
+	assert.equal(health.lastEventAt, null);
+	assert.equal(health.eventCount, 0);
+});
+
+test("recordValidEvent: starting -> running, first/last/eventCount, heartbeat age", () => {
+	let health = baseHealth();
+	health = recordValidEvent(health, { now: NOW + 1000 });
+	assert.equal(health.status, STATUS.RUNNING);
+	assert.equal(health.firstEventAt, new Date(NOW + 1000).toISOString());
+	assert.equal(health.lastEventAt, new Date(NOW + 1000).toISOString());
+	assert.equal(health.eventCount, 1);
+	assert.equal(health.attemptEventCount, 1);
+	assert.equal(health.lastReason, "valid_event");
+	health = recordValidEvent(health, { now: NOW + 2000 });
+	assert.equal(health.eventCount, 2);
+	assert.equal(health.firstEventAt, new Date(NOW + 1000).toISOString(), "first event stays pinned");
+	assert.equal(health.lastEventAt, new Date(NOW + 2000).toISOString());
+	assert.equal(healthHeartbeatAge(health, NOW + 2500), 500);
+});
+
+test("recordAttemptStart resets per-attempt fields, keeps cumulative eventCount", () => {
+	let health = baseHealth();
+	health = recordValidEvent(health, { now: NOW + 1000 });
+	health = recordAttemptStart(health, { attempt: 2, childPid: 777, now: NOW + 5000 });
+	assert.equal(health.status, STATUS.STARTING);
+	assert.equal(health.attempt, 2);
+	assert.equal(health.childPid, 777);
+	assert.equal(health.eventCount, 1, "cumulative across attempts");
+	assert.equal(health.attemptEventCount, 0);
+	assert.equal(health.firstEventAt, null);
+	assert.equal(health.lastEventAt, null);
+	assert.equal(health.lastReason, "attempt_started");
+});
+
+test("no-change watchdog stops only required unchanged work", () => {
+	assert.equal(shouldStopForNoChange({ requireChange: false, elapsedMs: 999999, toolCallCount: 999 }), false);
+	assert.equal(shouldStopForNoChange({ requireChange: true, changeDetected: true, elapsedMs: 999999, toolCallCount: 999 }), false);
+	assert.equal(shouldStopForNoChange({ requireChange: true, elapsedMs: 599999, timeoutMs: 600000, toolCallCount: 79, maxToolCalls: 80 }), false);
+	assert.equal(shouldStopForNoChange({ requireChange: true, elapsedMs: 600000, timeoutMs: 600000, toolCallCount: 0, maxToolCalls: 80 }), true);
+	assert.equal(shouldStopForNoChange({ requireChange: true, elapsedMs: 0, timeoutMs: 600000, toolCallCount: 80, maxToolCalls: 80 }), true);
+});
+
+test("worker receives the task contract inline without an @file lookup", () => {
+	assert.equal(
+		buildWorkerPromptArgument({ workerPrompt: "Implement the bounded task." }),
+		"Implement the bounded task.",
+	);
+	assert.throws(() => buildWorkerPromptArgument({ workerPrompt: "  " }), /non-empty string/);
+});
+
+test("Linux process stat treats zombies as terminated", () => {
+	assert.equal(isLinuxProcessRunningFromStat("123 (bash) S 1 2 3"), true);
+	assert.equal(isLinuxProcessRunningFromStat("123 (prime agent) R 1 2 3"), true);
+	assert.equal(isLinuxProcessRunningFromStat("123 (bash) Z 1 2 3"), false);
+	assert.equal(isLinuxProcessRunningFromStat("123 (bash) X 1 2 3"), false);
+	assert.equal(isLinuxProcessRunningFromStat(""), false);
+});
+
+test("captured WSL output decodes UTF-8 and UTF-16LE", () => {
+	assert.equal(decodeCapturedOutput(Buffer.from("0.7.4\n", "utf8")), "0.7.4\n");
+	assert.equal(decodeCapturedOutput(Buffer.from("\uFEFF0.7.4\r\n", "utf16le")), "0.7.4\r\n");
+	assert.equal(decodeCapturedOutput("plain"), "plain");
+});
+
+test("healthy startup decision: live pid, fresh heartbeat, exit 0", () => {
+	const health = baseHealth();
+	const result = evaluateHealthStatus(health, { now: NOW + 1000, isProcessAlive: aliveOnly });
+	assert.equal(result.healthy, true);
+	assert.equal(result.active, true);
+	assert.equal(result.stale, false);
+	assert.equal(result.reason, "healthy");
+	assert.equal(result.exitCode, 0);
+	assert.equal(result.status, STATUS.STARTING);
+	assert.equal(result.thresholdMs, 90000);
+});
+
+test("healthy running decision: events keep heartbeat fresh", () => {
+	let health = baseHealth();
+	health = recordValidEvent(health, { now: NOW + 1000 });
+	const result = evaluateHealthStatus(health, { now: NOW + 2000, isProcessAlive: aliveOnly });
+	assert.equal(result.healthy, true);
+	assert.equal(result.active, true);
+	assert.equal(result.reason, "healthy");
+	assert.equal(result.thresholdMs, 300000);
+});
+
+test("startup timeout: classification, restart allowed, status eval stale", () => {
+	const cls = classifyChildExit({ watchdogCondition: FAILURE_KIND.STARTUP_TIMEOUT });
+	assert.equal(cls.kind, FAILURE_KIND.STARTUP_TIMEOUT);
+	assert.equal(isInfraFailure(cls.kind), true);
+	const decision = decideRestart(restartArgs({ kind: cls.kind }));
+	assert.deepEqual(decision, { restart: true, reason: FAILURE_KIND.STARTUP_TIMEOUT });
+
+	// Health view: no event yet and startup grace elapsed -> stale/unhealthy.
+	const health = baseHealth({ attemptStartedAt: new Date(NOW - 100000).toISOString() });
+	const result = evaluateHealthStatus(health, { now: NOW, isProcessAlive: aliveOnly });
+	assert.equal(result.stale, true);
+	assert.equal(result.healthy, false);
+	assert.equal(result.reason, "stale_heartbeat");
+	assert.equal(result.exitCode, 1);
+});
+
+test("idle timeout: classification, restart allowed, status eval stale", () => {
+	const cls = classifyChildExit({ watchdogCondition: FAILURE_KIND.IDLE_TIMEOUT });
+	assert.equal(cls.kind, FAILURE_KIND.IDLE_TIMEOUT);
+	assert.equal(isInfraFailure(cls.kind), true);
+	const decision = decideRestart(restartArgs({ kind: cls.kind }));
+	assert.deepEqual(decision, { restart: true, reason: FAILURE_KIND.IDLE_TIMEOUT });
+
+	// Health view: running but last event older than idle timeout -> stale.
+	let health = baseHealth();
+	health = recordValidEvent(health, { now: NOW - 400000 });
+	const result = evaluateHealthStatus(health, { now: NOW, isProcessAlive: aliveOnly });
+	assert.equal(result.stale, true);
+	assert.equal(result.healthy, false);
+	assert.equal(result.reason, "stale_heartbeat");
+});
+
+test("changed worktree blocks restart -> unresponsive_with_changes", () => {
+	const decision = decideRestart(restartArgs({ worktreeMatchesBaseline: false }));
+	assert.deepEqual(decision, { restart: false, reason: "worktree_changed" });
+	const terminal = terminalStatusFor({ kind: FAILURE_KIND.STARTUP_TIMEOUT, restartDecision: decision });
+	assert.equal(terminal, STATUS.UNRESPONSIVE_WITH_CHANGES);
+	assert.equal(isTerminal(terminal), true);
+});
+
+test("restart budget exhaustion -> restart_exhausted", () => {
+	const decision = decideRestart(restartArgs({ restartCount: 1, maxInfraRestarts: 1 }));
+	assert.deepEqual(decision, { restart: false, reason: "restart_budget_exhausted" });
+	const terminal = terminalStatusFor({ kind: FAILURE_KIND.IDLE_TIMEOUT, restartDecision: decision });
+	assert.equal(terminal, STATUS.RESTART_EXHAUSTED);
+});
+
+test("overall deadline exhaustion blocks restart -> restart_exhausted", () => {
+	const decision = decideRestart(restartArgs({ now: FUTURE - 1000, overallDeadlineMs: FUTURE }));
+	assert.equal(decision.restart, false);
+	assert.equal(decision.reason, "overall_deadline_exhausted");
+	const terminal = terminalStatusFor({ kind: FAILURE_KIND.EXIT_BEFORE_FIRST_EVENT, restartDecision: decision });
+	assert.equal(terminal, STATUS.RESTART_EXHAUSTED);
+
+	// Enough room left: restart still allowed right up to the boundary.
+	const allowed = decideRestart(restartArgs({ kind: FAILURE_KIND.EXIT_BEFORE_FIRST_EVENT, now: FUTURE - 95000, overallDeadlineMs: FUTURE }));
+	assert.deepEqual(allowed, { restart: true, reason: FAILURE_KIND.EXIT_BEFORE_FIRST_EVENT });
+});
+
+test("maxInfraRestarts=0 never restarts", () => {
+	const decision = decideRestart(restartArgs({ maxInfraRestarts: 0 }));
+	assert.deepEqual(decision, { restart: false, reason: "restart_budget_exhausted" });
+});
+
+test("nonzero exit after valid event (gate/code failure) does not restart", () => {
+	const cls = classifyChildExit({ exitCode: 3, attemptEventCount: 5 });
+	assert.equal(cls.kind, "failed");
+	assert.equal(cls.reason, "nonzero_exit_after_event");
+	assert.equal(cls.terminalStatus, STATUS.FAILED);
+	const decision = decideRestart(restartArgs({ kind: cls.kind }));
+	assert.deepEqual(decision, { restart: false, reason: "failed_not_restartable" });
+	assert.equal(terminalStatusFor({ kind: cls.kind, restartDecision: decision }), STATUS.FAILED);
+});
+
+test("Prime autonomous failures have precise terminal reasons", () => {
+	const cases = [
+		["Autonomous run stopped before terminal evidence; maxTurns reached (36/12)", "max_turns_exhausted"],
+		["maxTokens reached (80000/80000)", "max_tokens_exhausted"],
+		["maxContinuations reached (3/3)", "max_continuations_exhausted"],
+		["timeoutMs reached (300000/300000)", "prime_timeout"],
+		["Autonomous quality gate still failing after attempt 3/3", "gate_failed"],
+	];
+	for (const [stderrPreview, reason] of cases) {
+		assert.equal(primeFailureReason(stderrPreview), reason);
+		const cls = classifyChildExit({ exitCode: 1, attemptEventCount: 1, stderrPreview });
+		assert.equal(cls.reason, reason);
+		assert.equal(cls.terminalStatus, STATUS.FAILED);
+	}
+	assert.equal(primeFailureReason("ordinary process error"), null);
+});
+
+test("normal exit does not restart", () => {
+	const cls = classifyChildExit({ exitCode: 0 });
+	assert.equal(cls.kind, "completed");
+	assert.equal(cls.terminalStatus, STATUS.COMPLETED);
+	const decision = decideRestart(restartArgs({ kind: cls.kind }));
+	assert.deepEqual(decision, { restart: false, reason: "completed_not_restartable" });
+});
+
+test("overall timeout does not restart", () => {
+	const cls = classifyChildExit({ timedOut: true, exitCode: null });
+	assert.equal(cls.kind, "timed_out");
+	assert.equal(cls.terminalStatus, STATUS.TIMED_OUT);
+	const decision = decideRestart(restartArgs({ kind: cls.kind }));
+	assert.deepEqual(decision, { restart: false, reason: "timed_out_not_restartable" });
+});
+
+test("known config/argument/spawn errors do not restart", () => {
+	const withStderr = classifyChildExit({ exitCode: 2, attemptEventCount: 0, stderrPreview: "Unknown argument: --bad" });
+	assert.equal(withStderr.kind, "config_error");
+	assert.equal(isKnownConfigurationError("Missing value for --cwd"), true);
+	assert.equal(isKnownConfigurationError("listen ENOTSUP: operation not supported on socket /mnt/c/tmp/daemon.sock"), true);
+	assert.equal(isKnownConfigurationError("temporary transport failure"), false);
+	const spawnFail = classifyChildExit({ spawnFailed: true });
+	assert.equal(spawnFail.kind, "config_error");
+	for (const cls of [withStderr, spawnFail]) {
+		const decision = decideRestart(restartArgs({ kind: cls.kind }));
+		assert.equal(decision.restart, false);
+		assert.equal(terminalStatusFor({ kind: cls.kind, restartDecision: decision }), STATUS.FAILED);
+	}
+});
+
+test("silent or generic stderr exit before first event is restartable", () => {
+	for (const stderrPreview of ["", "temporary transport failure"]) {
+		const cls = classifyChildExit({ exitCode: 1, attemptEventCount: 0, stderrPreview });
+		assert.equal(cls.kind, FAILURE_KIND.EXIT_BEFORE_FIRST_EVENT);
+		assert.deepEqual(decideRestart(restartArgs({ kind: cls.kind })), { restart: true, reason: FAILURE_KIND.EXIT_BEFORE_FIRST_EVENT });
+	}
+});
+
+test("terminated by signal is a failed attempt, not restartable", () => {
+	const cls = classifyChildExit({ exitCode: null, signal: "SIGTERM", attemptEventCount: 2 });
+	assert.equal(cls.kind, "failed");
+	assert.equal(cls.reason, "terminated_by_signal_SIGTERM");
+});
+
+test("terminal health/status evaluation", () => {
+	const cases = [
+		{ status: STATUS.COMPLETED, healthy: true, active: false, reason: "terminal_completed", exitCode: 0 },
+		{ status: STATUS.FAILED, healthy: false, active: false, reason: "terminal_failed", exitCode: 1 },
+		{ status: STATUS.TIMED_OUT, healthy: false, active: false, reason: "terminal_timed_out", exitCode: 1 },
+		{ status: STATUS.UNRESPONSIVE_WITH_CHANGES, healthy: false, active: false, reason: "terminal_unresponsive_with_changes", exitCode: 1 },
+		{ status: STATUS.RESTART_EXHAUSTED, healthy: false, active: false, reason: "terminal_restart_exhausted", exitCode: 1 },
+	];
+	for (const c of cases) {
+		const health = baseHealth({ status: c.status });
+		const result = evaluateHealthStatus(health, { now: NOW, isProcessAlive: aliveOnly });
+		assert.equal(result.healthy, c.healthy, `${c.status} healthy`);
+		assert.equal(result.active, c.active, `${c.status} active`);
+		assert.equal(result.reason, c.reason, `${c.status} reason`);
+		assert.equal(result.exitCode, c.exitCode, `${c.status} exit`);
+		assert.equal(result.stale, false, `${c.status} not stale`);
+	}
+});
+
+test("restarting is healthy during restart window and stale afterwards", () => {
+	let health = baseHealth();
+	health = recordRestarting(health, { reason: "restart_after_startup_timeout", restartCount: 1, now: NOW });
+	const fresh = evaluateHealthStatus(health, { now: NOW + 1000, isProcessAlive: dead });
+	assert.equal(fresh.healthy, true);
+	assert.equal(fresh.active, true);
+	assert.equal(fresh.reason, "restarting");
+	assert.equal(fresh.thresholdMs, 95000);
+	const stale = evaluateHealthStatus(health, { now: NOW + 95001, isProcessAlive: dead });
+	assert.equal(stale.healthy, false);
+	assert.equal(stale.active, false);
+	assert.equal(stale.reason, "stale_restart");
+});
+
+test("active attempt with dead PID is unhealthy", () => {
+	let health = baseHealth();
+	health = recordValidEvent(health, { now: NOW });
+	const result = evaluateHealthStatus(health, { now: NOW + 1000, isProcessAlive: dead });
+	assert.equal(result.active, false);
+	assert.equal(result.healthy, false);
+	assert.equal(result.reason, "child_pid_not_alive");
+	assert.equal(result.exitCode, 1);
+});
+
+test("active status with missing PID is unhealthy", () => {
+	const health = baseHealth({ childPid: null });
+	const result = evaluateHealthStatus(health, { now: NOW, isProcessAlive: aliveOnly });
+	assert.equal(result.active, false);
+	assert.equal(result.healthy, false);
+	assert.equal(result.reason, "missing_child_pid");
+	assert.equal(result.exitCode, 1);
+});
+
+test("missing health.json evaluates unhealthy", () => {
+	const result = evaluateHealthStatus(null, { now: NOW, isProcessAlive: aliveOnly });
+	assert.equal(result.healthy, false);
+	assert.equal(result.reason, "missing_health");
+	assert.equal(result.exitCode, 1);
+});
+
+test("recordRestarting / recordTerminal transitions", () => {
+	let health = baseHealth();
+	health = recordRestarting(health, { reason: "restart_after_startup_timeout", restartCount: 1, now: NOW + 10 });
+	assert.equal(health.status, STATUS.RESTARTING);
+	assert.equal(health.healthy, true);
+	assert.equal(health.active, true);
+	assert.equal(health.restartCount, 1);
+	assert.equal(health.childPid, null);
+	assert.equal(health.lastReason, "restart_after_startup_timeout");
+	health = recordTerminal(health, { status: STATUS.RESTART_EXHAUSTED, reason: "restart_budget_exhausted", now: NOW + 20 });
+	assert.equal(health.status, STATUS.RESTART_EXHAUSTED);
+	assert.equal(health.healthy, false);
+	assert.equal(health.active, false);
+	assert.equal(health.childPid, null);
+	assert.equal(health.lastReason, "restart_budget_exhausted");
+	assert.equal(health.updatedAt, new Date(NOW + 20).toISOString());
+});
+
+test("integer option boundaries", () => {
+	assert.equal(parseIntegerOption("90000", { min: 1, name: "--startup-grace-ms" }), 90000);
+	assert.equal(parseIntegerOption("300000", { min: 1, name: "--idle-timeout-ms" }), 300000);
+	assert.equal(parseIntegerOption("0", { min: 0, max: 3, name: "--max-infra-restarts" }), 0);
+	assert.equal(parseIntegerOption("3", { min: 0, max: 3, name: "--max-infra-restarts" }), 3);
+	assert.equal(parseIntegerOption("1", { min: 0, max: 3, name: "--max-infra-restarts" }), 1);
+	assert.equal(parseIntegerOption("0", { min: 0, name: "--restart-delay-ms" }), 0);
+	assert.equal(parseIntegerOption("5000", { min: 0, name: "--restart-delay-ms" }), 5000);
+	assert.throws(() => parseIntegerOption("0", { min: 1, name: "--startup-grace-ms" }), RangeError);
+	assert.throws(() => parseIntegerOption("4", { min: 0, max: 3, name: "--max-infra-restarts" }), RangeError);
+	assert.throws(() => parseIntegerOption("-1", { min: 0, name: "--restart-delay-ms" }), RangeError);
+	assert.throws(() => parseIntegerOption("1.5", { min: 1, name: "--startup-grace-ms" }), RangeError);
+	assert.throws(() => parseIntegerOption("abc", { min: 1, name: "--startup-grace-ms" }), RangeError);
+	assert.throws(() => parseIntegerOption("", { min: 1, name: "--startup-grace-ms" }), RangeError);
+	assert.throws(() => parseIntegerOption(null, { min: 1, name: "--startup-grace-ms" }), RangeError);
+	assert.throws(() => parseIntegerOption(undefined, { min: 1, name: "--startup-grace-ms" }), RangeError);
+	assert.throws(() => parseIntegerOption(NaN, { min: 1, name: "--startup-grace-ms" }), RangeError);
+});
+
+test("atomic health JSON write/read round trip and failure modes", () => {
+	const dir = mkdtempSync(join(tmpdir(), "delegate-watchdog-test-"));
+	const healthPath = join(dir, "health.json");
+	try {
+		const first = baseHealth();
+		atomicWriteJson(healthPath, first);
+		assert.deepEqual(readHealth(healthPath), first);
+		// Overwrite atomically with a terminal snapshot.
+		const terminal = recordTerminal(first, { status: STATUS.COMPLETED, reason: "normal_exit", now: NOW + 100 });
+		atomicWriteJson(healthPath, terminal);
+		assert.deepEqual(readHealth(healthPath), terminal);
+		// No leftover temp files.
+		const leftovers = readdirSync(dir).filter((name) => name.includes(".tmp-"));
+		assert.deepEqual(leftovers, []);
+		// Missing file and invalid JSON both read as null.
+		assert.equal(readHealth(join(dir, "nope.json")), null);
+		writeFileSync(healthPath, "{ not json", "utf8");
+		assert.equal(readHealth(healthPath), null);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("health helpers: isTerminal / isInfraFailure", () => {
+	assert.equal(isTerminal(STATUS.COMPLETED), true);
+	assert.equal(isTerminal(STATUS.RUNNING), false);
+	assert.equal(isTerminal(STATUS.STARTING), false);
+	assert.equal(isTerminal(STATUS.RESTARTING), false);
+	assert.equal(isInfraFailure(FAILURE_KIND.STARTUP_TIMEOUT), true);
+	assert.equal(isInfraFailure(FAILURE_KIND.IDLE_TIMEOUT), true);
+	assert.equal(isInfraFailure(FAILURE_KIND.EXIT_BEFORE_FIRST_EVENT), true);
+	assert.equal(isInfraFailure("failed"), false);
+});
