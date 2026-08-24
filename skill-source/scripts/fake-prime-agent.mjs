@@ -25,6 +25,9 @@ function makeChange() {
 		"created by fake Prime\n",
 		"utf8",
 	);
+	if (scenario === "unauthorized-change") {
+		writeFileSync(join(cwd, "unauthorized.txt"), "outside allowlist\n", "utf8");
+	}
 }
 
 const emit = (event) => process.stdout.write(`${JSON.stringify(event)}\n`);

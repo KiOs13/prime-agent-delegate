@@ -31,6 +31,7 @@ import {
 	isLinuxProcessRunningFromStat,
 	isTerminal,
 	normalizeRunMetadata,
+	parsePorcelainV1Z,
 	parseIntegerOption,
 	primeFailureReason,
 	readHealth,
@@ -228,6 +229,13 @@ test("UTF-8 byte splitting preserves Unicode code points and limits", () => {
 	for (const part of parts) assert.ok(Buffer.byteLength(part, "utf8") <= 8);
 	assert.deepEqual(splitUtf8ByBytes("😀😀", 4), ["😀", "😀"]);
 	assert.throws(() => splitUtf8ByBytes("😀", 3), /smaller than one Unicode code point/);
+});
+
+test("NUL-delimited porcelain parsing preserves exact paths and renames", () => {
+	assert.deepEqual(
+		parsePorcelainV1Z(" M plain.txt\0?? spaced name.txt\0R  renamed.txt\0old.txt\0?? Юникод.txt\0"),
+		["plain.txt", "spaced name.txt", "renamed.txt", "old.txt", "Юникод.txt"],
+	);
 });
 
 test("protocol lifecycle requires complete balanced evidence", () => {

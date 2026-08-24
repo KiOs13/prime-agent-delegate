@@ -248,6 +248,11 @@ Permit exactly the configured count, stop on the next turn without retry,
 classify it as `max_turns_exhausted`/`prime_limit` owned by `prime_agent`, and
 preserve any partial worktree diff.
 
+Independently parse NUL-delimited Git porcelain at child completion and require
+every changed path, including both rename paths, to exactly match an
+`--allow-change` value. Extra paths fail as `unauthorized_change`, class
+`contract`, owner `prime_agent`, without retry or cleanup of the partial worktree.
+
 ## Redaction and outcome
 
 Create one dependency-free structured sanitizer shared by audit and outcome
@@ -293,6 +298,7 @@ Cover:
 - provider, gate, and Prime-limit classifications;
 - repeated identical tool failures after a change, reset behavior, and partial diff preservation;
 - launcher-side autonomous turn-limit enforcement and partial diff preservation;
+- exact final allowlist enforcement for spaces, Unicode, and rename paths;
 - semantic-compact capture;
 - nested and string redaction;
 - run manifest hashes;

@@ -158,6 +158,9 @@ consecutive identical failed tool completions as `repeated_tool_failure`
 For autonomous runs, the launcher independently counts `turn_start` events and
 stops the first turn beyond `--autonomous-max-turns` as
 `max_turns_exhausted`, preserving any partial diff.
+At child completion, every changed Git path is also checked exactly against
+all `--allow-change` values. Any extra path fails as `unauthorized_change`
+without deleting the partial worktree.
 
 Check an existing run without starting Prime:
 

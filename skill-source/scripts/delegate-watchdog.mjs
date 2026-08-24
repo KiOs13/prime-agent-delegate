@@ -94,6 +94,22 @@ export function splitUtf8ByBytes(value, maxBytes) {
 	return parts;
 }
 
+export function parsePorcelainV1Z(value) {
+	const records = String(value).split("\0");
+	const paths = [];
+	for (let index = 0; index < records.length; index++) {
+		const record = records[index];
+		if (!record) continue;
+		const status = record.slice(0, 2);
+		paths.push(record.slice(3).replaceAll("\\", "/"));
+		if (/[RC]/.test(status)) {
+			const source = records[++index];
+			if (source) paths.push(source.replaceAll("\\", "/"));
+		}
+	}
+	return [...new Set(paths)];
+}
+
 export function createProtocolState() {
 	return {
 		sessionCount: 0,

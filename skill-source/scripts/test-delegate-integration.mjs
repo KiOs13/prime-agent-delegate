@@ -336,6 +336,36 @@ test("launcher stops autonomous runs on the first turn beyond the configured lim
 	assert.match(summary.worktreeDiff, /fake-prime-output\.txt/);
 });
 
+test("launcher rejects changes outside the exact allowlist", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "unauthorized-change");
+	const result = runDelegate({
+		cwd,
+		outDir,
+		scenario: "unauthorized-change",
+		prompt: "create one allowed and one unauthorized file",
+		args: [
+			"--autonomous",
+			"--require-change",
+			"--allow-change", "allowed.txt",
+			"--autonomous-gate", "true",
+			"--delegation-mode", "implement",
+		],
+		env: { PRIME_AGENT_DELEGATE_FAKE_CHANGE: "allowed.txt" },
+	});
+	assert.equal(result.status, 1, result.stderr);
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.terminalReason, "unauthorized_change");
+	assert.equal(summary.failureClass, "contract");
+	assert.equal(summary.failureOwner, "prime_agent");
+	assert.equal(summary.restartCount, 0);
+	assert.deepEqual(summary.unauthorizedChanges, ["unauthorized.txt"]);
+	assert.equal(existsSync(join(cwd, "allowed.txt")), true);
+	assert.equal(existsSync(join(cwd, "unauthorized.txt")), true);
+	assert.match(summary.worktreeDiff, /allowed\.txt/);
+	assert.match(summary.worktreeDiff, /unauthorized\.txt/);
+});
+
 test("invalid task contract is owned by task_spec", () => {
 	const cwd = createRepo();
 	const outDir = join(cwd, ".prime-delegate", "runs", "task-spec");

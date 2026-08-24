@@ -23,6 +23,7 @@ import {
 	evaluateHealthStatus,
 	isLinuxProcessRunningFromStat,
 	normalizeRunMetadata,
+	parsePorcelainV1Z,
 	readHealth,
 	recordAttemptStart,
 	recordProtocolEvent,
@@ -630,6 +631,7 @@ let forcedTerminalReason = null;
 let rpcStateId = null;
 let rpcPromptId = null;
 let repeatedToolFailure = { fingerprint: null, count: 0, toolName: null };
+let finalUnauthorizedChanges = [];
 
 function flushHealth() {
 	if (healthWriteTimer) {
@@ -973,6 +975,16 @@ function currentGitPorcelain() {
 	return { ok: true, value: result.stdout };
 }
 
+function currentGitChangedPaths() {
+	const command = gitContext.environment.length > 0
+		? ["env", ...gitContext.environment, "git", "status", "--porcelain=v1", "-z"]
+		: ["git", "status", "--porcelain=v1", "-z"];
+	const cmd = `cd ${shellQuote(wslCwd)} && ${shellJoin(command)}`;
+	const result = runWslBashSync(cmd, { timeout: 60000 });
+	if (result.status !== 0 || result.error) return { ok: false, error: "git_status_failed" };
+	return { ok: true, paths: parsePorcelainV1Z(result.stdout) };
+}
+
 function onChildClose(code, signal) {
 	if (finalized || attemptClosed) return;
 	attemptClosed = true;
@@ -1030,6 +1042,49 @@ function onChildClose(code, signal) {
 		}
 		finalize(STATUS.FAILED, forcedTerminalReason, forcedTerminalReason);
 		return;
+	}
+
+	if (options.allowedChanges.length > 0) {
+		const changedPaths = currentGitChangedPaths();
+		if (!changedPaths.ok) {
+			lastClassification = {
+				kind: "failed",
+				reason: changedPaths.error,
+				terminalStatus: STATUS.FAILED,
+				failureClass: "git",
+				failureOwner: "delegate_skill",
+			};
+			finalize(STATUS.FAILED, changedPaths.error, "git_status_failed");
+			return;
+		}
+		const allowed = new Set(options.allowedChanges);
+		finalUnauthorizedChanges = changedPaths.paths.filter((path) => !allowed.has(path));
+		if (finalUnauthorizedChanges.length > 0) {
+			const porcelainResult = currentGitPorcelain();
+			if (!porcelainResult.ok) {
+				lastClassification = {
+					kind: "failed",
+					reason: porcelainResult.error,
+					terminalStatus: STATUS.FAILED,
+					failureClass: "git",
+					failureOwner: "delegate_skill",
+				};
+				finalize(STATUS.FAILED, porcelainResult.error, "git_status_failed");
+				return;
+			}
+			lastClassification = {
+				kind: "failed",
+				reason: "unauthorized_change",
+				terminalStatus: STATUS.FAILED,
+				failureClass: "contract",
+				failureOwner: "prime_agent",
+			};
+			attempts[attempts.length - 1].kind = "failed";
+			attempts[attempts.length - 1].reason = "unauthorized_change";
+			appendSyntheticEvent({ kind: "unauthorized_change", count: finalUnauthorizedChanges.length });
+			finalize(STATUS.FAILED, "unauthorized_change", "unauthorized_change", porcelainResult.value);
+			return;
+		}
 	}
 
 	if (runMetadata.delegationMode === "investigate") {
@@ -1216,6 +1271,7 @@ function finalize(status, reason, decisionReason, worktreeDiff) {
 		protocol: finalProtocol,
 		requireChange: options.requireChange,
 		allowedChanges: options.allowedChanges,
+		unauthorizedChanges: finalUnauthorizedChanges,
 		eventCount,
 		persistedEventCount,
 		droppedStreamingEventCount,
