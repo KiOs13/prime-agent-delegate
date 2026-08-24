@@ -38,7 +38,10 @@ import {
 } from "./delegate-watchdog.mjs";
 
 const DISTRO = "Ubuntu";
-const PRIME_AGENT = "/usr/bin/prime-agent";
+const TEST_MODE = process.env.PRIME_AGENT_DELEGATE_TEST_MODE === "1";
+const PRIME_AGENT = TEST_MODE && process.env.PRIME_AGENT_DELEGATE_TEST_EXEC
+	? process.env.PRIME_AGENT_DELEGATE_TEST_EXEC
+	: "/usr/bin/prime-agent";
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_STARTUP_GRACE_MS = 90000;
 const DEFAULT_IDLE_TIMEOUT_MS = 300000;
