@@ -176,6 +176,15 @@ test("repeated tool failures are terminal Prime loops", () => {
 	assert.equal(decideRestart(restartArgs({ kind: cls.kind })).restart, false);
 });
 
+test("launcher turn limit is a terminal Prime limit", () => {
+	const cls = classifyChildExit({ watchdogCondition: FAILURE_KIND.MAX_TURNS_EXHAUSTED });
+	assert.equal(cls.kind, "failed");
+	assert.equal(cls.reason, "max_turns_exhausted");
+	assert.equal(cls.failureClass, "prime_limit");
+	assert.equal(cls.failureOwner, "prime_agent");
+	assert.equal(decideRestart(restartArgs({ kind: cls.kind })).restart, false);
+});
+
 test("worker receives the task contract inline without an @file lookup", () => {
 	assert.equal(
 		buildWorkerPromptArgument({ workerPrompt: "Implement the bounded task." }),

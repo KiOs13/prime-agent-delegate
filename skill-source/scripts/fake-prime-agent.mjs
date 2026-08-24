@@ -86,6 +86,15 @@ function emitScenario({ includeSession = true } = {}) {
 		}
 		return;
 	}
+	if (scenario === "max-turns") {
+		if (includeSession) emit({ type: "session", version: 3 });
+		emit({ type: "agent_start" });
+		for (let index = 1; index <= 6; index++) {
+			emit({ type: "turn_start", turn: index });
+			emit({ type: "turn_end", turn: index });
+		}
+		return;
+	}
 	for (const event of lifecycle) emit(event);
 }
 

@@ -155,6 +155,9 @@ consecutive identical failed tool completions as `repeated_tool_failure`
 (`tool_loop`, owned by `prime_agent`) while preserving the partial worktree.
 `--require-change` is also checked by the launcher at process completion; exit
 0 without a worktree change fails as `required_change_missing`.
+For autonomous runs, the launcher independently counts `turn_start` events and
+stops the first turn beyond `--autonomous-max-turns` as
+`max_turns_exhausted`, preserving any partial diff.
 
 Check an existing run without starting Prime:
 

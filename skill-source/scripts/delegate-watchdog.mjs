@@ -34,6 +34,7 @@ export const FAILURE_KIND = Object.freeze({
 	EXIT_BEFORE_FIRST_EVENT: "exit_before_first_event",
 	NO_CHANGE_PROGRESS: "no_change_progress",
 	REPEATED_TOOL_FAILURE: "repeated_tool_failure",
+	MAX_TURNS_EXHAUSTED: "max_turns_exhausted",
 });
 
 const ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
@@ -237,6 +238,7 @@ export function createHealth(options = {}) {
 		repeatedToolFailureLimit: options.repeatedToolFailureLimit ?? 8,
 		repeatedToolFailureCount: options.repeatedToolFailureCount ?? 0,
 		repeatedToolFailureTool: options.repeatedToolFailureTool ?? null,
+		attemptTurnCount: options.attemptTurnCount ?? 0,
 		restartDelayMs: options.restartDelayMs ?? 5000,
 		overallTimeoutMs: options.overallTimeoutMs ?? 30 * 60 * 1000,
 	};
@@ -270,6 +272,7 @@ export function recordAttemptStart(health, { attempt, childPid, now = Date.now()
 		changeDetectedAt: null,
 		repeatedToolFailureCount: 0,
 		repeatedToolFailureTool: null,
+		attemptTurnCount: 0,
 		lastReason: "attempt_started",
 		now,
 	});
@@ -277,7 +280,7 @@ export function recordAttemptStart(health, { attempt, childPid, now = Date.now()
 
 // Called for every valid parsed JSON event on stdout. eventCount is
 // cumulative across attempts; attemptEventCount counts the current attempt.
-export function recordValidEvent(health, { now = Date.now(), toolCall = false } = {}) {
+export function recordValidEvent(health, { now = Date.now(), toolCall = false, turnStart = false } = {}) {
 	const iso = new Date(now).toISOString();
 	return updateHealth(health, {
 		status: STATUS.RUNNING,
@@ -286,6 +289,7 @@ export function recordValidEvent(health, { now = Date.now(), toolCall = false } 
 		eventCount: (health.eventCount ?? 0) + 1,
 		attemptEventCount: (health.attemptEventCount ?? 0) + 1,
 		attemptToolCallCount: (health.attemptToolCallCount ?? 0) + (toolCall ? 1 : 0),
+		attemptTurnCount: (health.attemptTurnCount ?? 0) + (turnStart ? 1 : 0),
 		lastReason: "valid_event",
 		now,
 	});
@@ -344,6 +348,9 @@ export function classifyChildExit({
 	}
 	if (watchdogCondition === FAILURE_KIND.REPEATED_TOOL_FAILURE) {
 		return result("failed", FAILURE_KIND.REPEATED_TOOL_FAILURE, STATUS.FAILED, "tool_loop", "prime_agent");
+	}
+	if (watchdogCondition === FAILURE_KIND.MAX_TURNS_EXHAUSTED) {
+		return result("failed", FAILURE_KIND.MAX_TURNS_EXHAUSTED, STATUS.FAILED, "prime_limit", "prime_agent");
 	}
 	if (spawnFailed) {
 		return result("config_error", "spawn_error", STATUS.FAILED, "spawn", "environment");

@@ -308,6 +308,34 @@ test("repeated tool failures after a change stop without retry and preserve the 
 	assert.match(summary.worktreeDiff, /fake-prime-output\.txt/);
 });
 
+test("launcher stops autonomous runs on the first turn beyond the configured limit", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "max-turns");
+	const result = runDelegate({
+		cwd,
+		outDir,
+		scenario: "max-turns",
+		prompt: "change one file, then exceed the turn limit",
+		args: [
+			"--autonomous",
+			"--require-change",
+			"--allow-change", "fake-prime-output.txt",
+			"--autonomous-gate", "test -f fake-prime-output.txt",
+			"--delegation-mode", "implement",
+			"--autonomous-max-turns", "3",
+		],
+	});
+	assert.equal(result.status, 1, result.stderr);
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.terminalReason, "max_turns_exhausted");
+	assert.equal(summary.failureClass, "prime_limit");
+	assert.equal(summary.failureOwner, "prime_agent");
+	assert.equal(summary.autonomousMaxTurns, 3);
+	assert.equal(summary.observedTurnCount, 4);
+	assert.equal(summary.restartCount, 0);
+	assert.match(summary.worktreeDiff, /fake-prime-output\.txt/);
+});
+
 test("invalid task contract is owned by task_spec", () => {
 	const cwd = createRepo();
 	const outDir = join(cwd, ".prime-delegate", "runs", "task-spec");

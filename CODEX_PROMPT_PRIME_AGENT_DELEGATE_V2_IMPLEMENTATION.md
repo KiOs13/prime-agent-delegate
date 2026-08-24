@@ -243,6 +243,11 @@ summary telemetry, classify the terminal result as `repeated_tool_failure`
 with class `tool_loop` and owner `prime_agent`, do not retry, and preserve the
 partial worktree for Codex takeover.
 
+Independently enforce `--autonomous-max-turns` from valid `turn_start` events.
+Permit exactly the configured count, stop on the next turn without retry,
+classify it as `max_turns_exhausted`/`prime_limit` owned by `prime_agent`, and
+preserve any partial worktree diff.
+
 ## Redaction and outcome
 
 Create one dependency-free structured sanitizer shared by audit and outcome
@@ -287,6 +292,7 @@ Cover:
 - malformed JSON and unmatched tools;
 - provider, gate, and Prime-limit classifications;
 - repeated identical tool failures after a change, reset behavior, and partial diff preservation;
+- launcher-side autonomous turn-limit enforcement and partial diff preservation;
 - semantic-compact capture;
 - nested and string redaction;
 - run manifest hashes;

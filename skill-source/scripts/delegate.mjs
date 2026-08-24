@@ -739,12 +739,23 @@ function processEventLine(rawLine) {
 
 function onValidEvent(event) {
 	if (forcedTerminalReason) return;
-	if (pendingCondition === FAILURE_KIND.REPEATED_TOOL_FAILURE) return;
+	if ([FAILURE_KIND.REPEATED_TOOL_FAILURE, FAILURE_KIND.MAX_TURNS_EXHAUSTED].includes(pendingCondition)) return;
 	const wasFirstEvent = !firstEventSeen;
 	firstEventSeen = true;
 	const now = Date.now();
 	const toolCall = event?.type === "tool_execution_start";
-	health = recordValidEvent(health, { now, toolCall });
+	const turnStart = event?.type === "turn_start";
+	health = recordValidEvent(health, { now, toolCall, turnStart });
+	if (options.autonomous && turnStart && health.attemptTurnCount > autonomousMaxTurns) {
+		pendingCondition = FAILURE_KIND.MAX_TURNS_EXHAUSTED;
+		appendSyntheticEvent({
+			kind: FAILURE_KIND.MAX_TURNS_EXHAUSTED,
+			limit: autonomousMaxTurns,
+			observed: health.attemptTurnCount,
+		});
+		terminateChild(FAILURE_KIND.MAX_TURNS_EXHAUSTED);
+		return;
+	}
 	if (options.requireChange && !health.changeDetectedAt && toolCall) {
 		const porcelain = currentGitPorcelain();
 		if (!porcelain.ok) {
@@ -1082,7 +1093,9 @@ function onChildClose(code, signal) {
 	}
 
 	if (classification.kind === "completed" || classification.kind === "timed_out" || classification.kind === "failed" || classification.kind === "config_error") {
-		const porcelain = classification.reason === FAILURE_KIND.REPEATED_TOOL_FAILURE ? currentGitPorcelain() : null;
+		const porcelain = [FAILURE_KIND.REPEATED_TOOL_FAILURE, FAILURE_KIND.MAX_TURNS_EXHAUSTED].includes(classification.reason)
+			? currentGitPorcelain()
+			: null;
 		finalize(
 			classification.terminalStatus,
 			classification.reason,
@@ -1181,6 +1194,7 @@ function finalize(status, reason, decisionReason, worktreeDiff) {
 		repeatedToolFailureLimit,
 		repeatedToolFailureCount: health.repeatedToolFailureCount,
 		repeatedToolFailureTool: health.repeatedToolFailureTool,
+		observedTurnCount: health.attemptTurnCount,
 		maxInfraRestarts,
 		restartDelayMs,
 		autonomous: options.autonomous,
