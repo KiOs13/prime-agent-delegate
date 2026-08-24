@@ -349,7 +349,7 @@ export function classifyChildExit({
 	}
 	if (attemptEventCount > 0) {
 		const reason = primeFailureReason(stderrPreview) ?? "nonzero_exit_after_event";
-		if (reason === "provider_rate_limited" || reason === "provider_unavailable") {
+		if (reason === "provider_rate_limited" || reason === "provider_unavailable" || reason === "provider_network_error") {
 			return result("failed", reason, STATUS.FAILED, "provider", "provider");
 		}
 		if (reason === "gate_failed") return result("failed", reason, STATUS.FAILED, "gate", "project");
@@ -380,6 +380,7 @@ export function primeFailureReason(stderrPreview) {
 	if (/Autonomous quality gate still failing/i.test(text)) return "gate_failed";
 	if (/(?:HTTP\s*)?429|rate.?limit/i.test(text)) return "provider_rate_limited";
 	if (/(?:HTTP\s*)?503|service unavailable/i.test(text)) return "provider_unavailable";
+	if (/\b(?:ECONNRESET|ENOTFOUND|EAI_AGAIN|ETIMEDOUT)\b/i.test(text)) return "provider_network_error";
 	return null;
 }
 

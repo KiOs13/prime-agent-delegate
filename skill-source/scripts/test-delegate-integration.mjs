@@ -106,6 +106,49 @@ test("normal lifecycle preserves semantic terminal events and seals artifacts", 
 	}
 });
 
+test("no-tools keeps readable tasks inline and rejects oversized payloads before artifacts", () => {
+	const cwd = createRepo();
+	const inlineOut = join(cwd, ".prime-delegate", "runs", "no-tools-inline");
+	const inline = runDelegate({
+		cwd,
+		outDir: inlineOut,
+		prompt: "Reply with exactly NO_TOOLS_OK",
+		args: ["--no-tools"],
+	});
+	assert.equal(inline.status, 0, inline.stderr);
+	assert.equal(json(join(inlineOut, "summary.json")).transport.mode, "inline");
+	assert.equal(existsSync(join(inlineOut, "task-parts")), false);
+
+	const oversizedOut = join(cwd, ".prime-delegate", "runs", "no-tools-oversized");
+	const oversized = runDelegate({
+		cwd,
+		outDir: oversizedOut,
+		prompt: "x".repeat(2000),
+		args: ["--no-tools"],
+	});
+	assert.equal(oversized.status, 2);
+	assert.equal(existsSync(oversizedOut), false);
+});
+
+test("investigate fails when Prime changes the worktree", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "read-only");
+	const result = runDelegate({
+		cwd,
+		outDir,
+		prompt: "read only",
+		env: {
+			PRIME_AGENT_DELEGATE_FAKE_FORCE_CHANGE: "1",
+			PRIME_AGENT_DELEGATE_FAKE_CHANGE: "unexpected.txt",
+		},
+	});
+	assert.equal(result.status, 1, result.stderr);
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.terminalReason, "read_only_violation");
+	assert.equal(summary.failureOwner, "prime_agent");
+	assert.match(summary.worktreeDiff, /unexpected\.txt/);
+});
+
 test("exit zero with incomplete lifecycle is a Prime protocol failure", () => {
 	for (const scenario of ["no-events", "missing-agent-end", "malformed", "unmatched-tool"]) {
 		const cwd = createRepo();

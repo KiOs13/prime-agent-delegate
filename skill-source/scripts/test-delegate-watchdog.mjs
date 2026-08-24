@@ -351,6 +351,7 @@ test("provider failures are classified deterministically", () => {
 	for (const [stderrPreview, reason] of [
 		["HTTP 429 rate limit exceeded", "provider_rate_limited"],
 		["503 Service Unavailable", "provider_unavailable"],
+		["request failed: ECONNRESET", "provider_network_error"],
 	]) {
 		const cls = classifyChildExit({ exitCode: 1, attemptEventCount: 1, stderrPreview });
 		assert.equal(cls.reason, reason);

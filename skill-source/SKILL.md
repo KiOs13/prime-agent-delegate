@@ -56,7 +56,8 @@ node <skill-dir>\scripts\delegate.mjs --prepare-command `
 ## Modes
 
 Read-only investigation uses the default single-shot mode and explicitly
-forbids edits.
+forbids edits. The launcher compares the final Git state with the launch
+baseline and fails with `read_only_violation` if Prime changes the worktree.
 
 Implementation uses:
 
@@ -70,6 +71,10 @@ Implementation uses:
 
 Repeat `--allow-change` for each permitted file. Prototype mode uses
 `--delegation-mode prototype`; use autonomous gates whenever it may edit.
+
+`--no-tools` supports only tasks whose complete effective prompt fits the
+1024-byte inline limit. Larger tasks fail before inference because Prime could
+not read split task files without tools.
 
 Optional metadata:
 

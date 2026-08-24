@@ -55,7 +55,7 @@ const DEFAULT_NO_CHANGE_MAX_TOOL_CALLS = 80;
 const DEFAULT_AUTONOMOUS_MAX_CONTINUATIONS = 3;
 const DEFAULT_AUTONOMOUS_MAX_TURNS = 12;
 const DEFAULT_AUTONOMOUS_MAX_TOKENS = 1000000;
-const INLINE_TASK_MAX_BYTES = 160;
+const INLINE_TASK_MAX_BYTES = 1024;
 const TASK_CHUNK_MAX_BYTES = 600;
 const TERMINATE_GRACE_MS = 2000;
 const HEALTH_WRITE_INTERVAL_MS = 1000;
@@ -432,6 +432,22 @@ const autonomousMaxTokens = parseIntOption(options.autonomousMaxTokens ?? DEFAUL
 const prompt = readFileSync(promptFile, "utf8").trim();
 if (!prompt) fail("--prompt-file is empty");
 
+const workerRules = [
+	"You are a delegated coding worker. Work only in cwd.",
+	"Do not commit, push, deploy, alter credentials, or perform destructive cleanup.",
+	"Use targeted reads. Do not open worker-prompt.md; it is only an audit artifact.",
+	options.requireChange
+		? `Make the first allowed edit within ${noChangeTimeoutMs} ms or ${noChangeMaxToolCalls} tool calls.`
+		: "Do not edit unless the task explicitly requests it.",
+	options.autonomous ? "The host runs final gates. Return changed files, checks, and blockers." : "Return one concise final report.",
+];
+const auditTaskContract = [...workerRules, "", "TASK:", prompt].join("\n");
+const taskBytes = Buffer.byteLength(prompt, "utf8");
+const effectiveTaskContractBytes = Buffer.byteLength(auditTaskContract, "utf8");
+if (options.noTools && effectiveTaskContractBytes > INLINE_TASK_MAX_BYTES) {
+	fail(`--no-tools effective payload exceeds ${INLINE_TASK_MAX_BYTES} UTF-8 bytes`);
+}
+
 const runId = randomUUID();
 const wslCwd = toWslPath(cwd);
 const gitContext = resolveWslGitContext(cwd, wslCwd);
@@ -454,23 +470,11 @@ if (options.requireChange && gitContext.baseline !== "") {
 }
 const primeVersion = readPrimeVersion();
 
-const workerRules = [
-	"You are a delegated coding worker. Work only in cwd.",
-	"Do not commit, push, deploy, alter credentials, or perform destructive cleanup.",
-	"Use targeted reads. Do not open worker-prompt.md; it is only an audit artifact.",
-	options.requireChange
-		? `Make the first allowed edit within ${noChangeTimeoutMs} ms or ${noChangeMaxToolCalls} tool calls.`
-		: "Do not edit unless the task explicitly requests it.",
-	options.autonomous ? "The host runs final gates. Return changed files, checks, and blockers." : "Return one concise final report.",
-];
-const auditTaskContract = [...workerRules, "", "TASK:", prompt].join("\n");
 writeFileSync(workerPromptPath, `${auditTaskContract}\n`, "utf8");
 
 let primeTask;
 let taskPartCount = 0;
 let maxTaskPartBytes = 0;
-const taskBytes = Buffer.byteLength(prompt, "utf8");
-const effectiveTaskContractBytes = Buffer.byteLength(auditTaskContract, "utf8");
 let transportMode;
 if (effectiveTaskContractBytes <= INLINE_TASK_MAX_BYTES) {
 	transportMode = "inline";
@@ -888,6 +892,35 @@ function onChildClose(code, signal) {
 	if (forcedTerminalReason) {
 		finalize(STATUS.FAILED, forcedTerminalReason, forcedTerminalReason);
 		return;
+	}
+
+	if (runMetadata.delegationMode === "investigate") {
+		const porcelainResult = currentGitPorcelain();
+		if (!porcelainResult.ok) {
+			lastClassification = {
+				kind: "failed",
+				reason: porcelainResult.error,
+				terminalStatus: STATUS.FAILED,
+				failureClass: "git",
+				failureOwner: "environment",
+			};
+			finalize(STATUS.FAILED, porcelainResult.error, "git_status_failed");
+			return;
+		}
+		if (porcelainResult.value !== gitContext.baseline) {
+			lastClassification = {
+				kind: "failed",
+				reason: "read_only_violation",
+				terminalStatus: STATUS.FAILED,
+				failureClass: "contract",
+				failureOwner: "prime_agent",
+			};
+			attempts[attempts.length - 1].kind = "failed";
+			attempts[attempts.length - 1].reason = "read_only_violation";
+			appendSyntheticEvent({ kind: "read_only_violation" });
+			finalize(STATUS.FAILED, "read_only_violation", "investigate_worktree_changed", porcelainResult.value);
+			return;
+		}
 	}
 
 	if (classification.kind === "completed" || classification.kind === "timed_out" || classification.kind === "failed" || classification.kind === "config_error") {

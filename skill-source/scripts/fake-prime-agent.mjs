@@ -16,7 +16,7 @@ if (args.includes("status") && args.includes("--json")) {
 const scenario = process.env.PRIME_AGENT_DELEGATE_FAKE_SCENARIO ?? "normal";
 const cwdIndex = args.indexOf("--cwd");
 const cwd = cwdIndex >= 0 ? args[cwdIndex + 1] : null;
-if (args.includes("--autonomous") && cwd && existsSync(cwd)) {
+if ((args.includes("--autonomous") || process.env.PRIME_AGENT_DELEGATE_FAKE_FORCE_CHANGE === "1") && cwd && existsSync(cwd)) {
 	writeFileSync(
 		join(cwd, process.env.PRIME_AGENT_DELEGATE_FAKE_CHANGE ?? "fake-prime-output.txt"),
 		"created by fake Prime\n",
