@@ -1,27 +1,36 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	FAILURE_KIND,
 	STATUS,
+	DELEGATE_VERSION,
+	SUMMARY_SCHEMA_VERSION,
 	parseIntegerOption,
 	atomicWriteJson,
 	buildWorkerPromptArgument,
 	classifyChildExit,
+	createProtocolState,
 	createHealth,
 	decodeCapturedOutput,
 	decideRestart,
+	evaluateProtocol,
 	evaluateHealthStatus,
 	isLinuxProcessRunningFromStat,
+	normalizeRunMetadata,
 	readHealth,
 	recordAttemptStart,
+	recordProtocolEvent,
+	recordProtocolParseError,
 	recordRestarting,
 	recordTerminal,
 	recordValidEvent,
 	shouldStopForNoChange,
+	splitUtf8ByBytes,
 	terminalStatusFor,
 	updateHealth,
 	windowsProcessAlive,
@@ -39,8 +48,8 @@ const DEFAULT_NO_CHANGE_MAX_TOOL_CALLS = 80;
 const DEFAULT_AUTONOMOUS_MAX_CONTINUATIONS = 3;
 const DEFAULT_AUTONOMOUS_MAX_TURNS = 12;
 const DEFAULT_AUTONOMOUS_MAX_TOKENS = 1000000;
-const INLINE_TASK_MAX_CHARS = 160;
-const TASK_CHUNK_CHARS = 600;
+const INLINE_TASK_MAX_BYTES = 160;
+const TASK_CHUNK_MAX_BYTES = 600;
 const TERMINATE_GRACE_MS = 2000;
 const HEALTH_WRITE_INTERVAL_MS = 1000;
 const STDERR_PREVIEW_MAX_BYTES = 4096;
@@ -55,6 +64,7 @@ function parseArgs(argv) {
 	const options = { check: false, noTools: false, autonomous: false, autonomousGates: [], allowedChanges: [], fullEvents: false, requireChange: false, wslMode: false, prepareCommand: false };
 	const valueArgs = new Set([
 		"--cwd", "--prompt-file", "--out-dir", "--timeout-ms", "--provider", "--model", "--thinking",
+		"--task-id", "--work-package-id", "--task-type", "--delegation-mode",
 		"--autonomous-max-continuations", "--autonomous-max-turns", "--autonomous-max-tokens",
 		"--startup-grace-ms", "--idle-timeout-ms", "--max-infra-restarts", "--restart-delay-ms",
 		"--no-change-timeout-ms", "--no-change-max-tool-calls", "--status-dir",
@@ -161,6 +171,13 @@ function checkInstallation() {
 	process.exit(report.ok ? 0 : 1);
 }
 
+function readPrimeVersion() {
+	const result = runLocalSync([PRIME_AGENT + " --version"]);
+	const version = (result.stdout.trim() || result.stderr.trim()).split(/\r?\n/, 1)[0] ?? "";
+	if (result.status !== 0 || !version) fail("prime-agent --version failed");
+	return version;
+}
+
 // --status-dir: read-only health check against a previous run's out-dir.
 // Never starts Prime Agent. Exits 0 only for healthy/non-stale state.
 function runStatusCommand(statusDir) {
@@ -213,8 +230,13 @@ function resolveWslGitContext(cwd, wslCwd) {
 		if (lstatSync(dotGit).isFile()) {
 			const match = readFileSync(dotGit, "utf8").trim().match(/^gitdir:\s*(.+)$/i);
 			if (!match) fail(`Unsupported linked worktree metadata: ${dotGit}`);
-			const windowsGitDir = isAbsolute(match[1]) || /^[A-Za-z]:[\\/]/.test(match[1]) ? match[1] : resolve(cwd, match[1]);
-			const wslGitDir = toWslPath(windowsGitDir);
+			const rawGitDir = match[1].trim();
+			const gitDir = /^[A-Za-z]:[\\/]/.test(rawGitDir)
+				? windowsPathToWslPath(rawGitDir)
+				: rawGitDir.startsWith("/")
+					? rawGitDir
+					: toWslPath(resolve(cwd, rawGitDir));
+			const wslGitDir = toWslPath(gitDir);
 			environment = [`GIT_DIR=${wslGitDir}`, `GIT_WORK_TREE=${wslCwd}`];
 			mode = "linked-worktree";
 		}
@@ -230,6 +252,22 @@ function resolveWslGitContext(cwd, wslCwd) {
 		fail(`WSL Git preflight failed for ${cwd}: ${(result.stderr || result.stdout).trim()}`);
 	}
 	return { environment, mode, baseline: result.stdout };
+}
+
+function isPathInside(parent, candidate) {
+	const rel = relative(parent, candidate);
+	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function ensureOutputIgnored({ cwd, wslCwd, outDir, gitContext }) {
+	if (!isPathInside(cwd, outDir)) return;
+	const relativeOut = relative(cwd, outDir).replaceAll("\\", "/") || ".";
+	const command = gitContext.environment.length > 0
+		? ["env", ...gitContext.environment, "git", "check-ignore", "-q", "--", relativeOut]
+		: ["git", "check-ignore", "-q", "--", relativeOut];
+	const cmd = `cd ${shellQuote(wslCwd)} && ${shellJoin(command)}`;
+	const result = runWslBashSync(cmd);
+	if (result.status !== 0) fail(`Output path inside the worktree must be ignored by Git: ${relativeOut}`);
 }
 
 function assistantText(message) {
@@ -303,6 +341,12 @@ if ((options.requireChange || options.allowedChanges.length > 0) && !options.aut
 if (options.autonomous && options.autonomousGates.length === 0) {
 	fail("--autonomous requires at least one explicit --autonomous-gate");
 }
+let runMetadata;
+try {
+	runMetadata = normalizeRunMetadata(options);
+} catch (error) {
+	fail(error.message);
+}
 
 if (options.prepareCommand) {
 	const parts = ["/usr/bin/node", windowsPathToWslPath(join(SCRIPT_DIR, "delegate.mjs")), "--wsl-mode"];
@@ -319,6 +363,10 @@ if (options.prepareCommand) {
 	if (options.provider) parts.push("--provider", options.provider);
 	if (options.model) parts.push("--model", options.model);
 	if (options.thinking) parts.push("--thinking", options.thinking);
+	if (options.taskId) parts.push("--task-id", options.taskId);
+	if (options.workPackageId) parts.push("--work-package-id", options.workPackageId);
+	if (options.taskType) parts.push("--task-type", options.taskType);
+	if (options.delegationMode) parts.push("--delegation-mode", options.delegationMode);
 	if (options.noTools) parts.push("--no-tools");
 	if (options.fullEvents) parts.push("--full-events");
 	if (options.requireChange) parts.push("--require-change");
@@ -356,7 +404,11 @@ const autonomousMaxTokens = parseIntOption(options.autonomousMaxTokens ?? DEFAUL
 const prompt = readFileSync(promptFile, "utf8").trim();
 if (!prompt) fail("--prompt-file is empty");
 
-const outDir = resolve(options.outDir ?? join(cwd, ".codex", "prime-agent-runs", new Date().toISOString().replaceAll(":", "-")));
+const runId = randomUUID();
+const wslCwd = toWslPath(cwd);
+const gitContext = resolveWslGitContext(cwd, wslCwd);
+const outDir = resolve(options.outDir ?? join(cwd, ".prime-delegate", "runs", runId));
+ensureOutputIgnored({ cwd, wslCwd, outDir, gitContext });
 mkdirSync(outDir, { recursive: true });
 
 const eventsPath = join(outDir, "events.jsonl");
@@ -368,11 +420,10 @@ const healthPath = join(outDir, "health.json");
 const runtimeBinDir = join(outDir, "runtime-bin");
 const events = createWriteStream(eventsPath, { encoding: "utf8" });
 const errors = createWriteStream(stderrPath, { encoding: "utf8" });
-const wslCwd = toWslPath(cwd);
-const gitContext = resolveWslGitContext(cwd, wslCwd);
 if (options.requireChange && gitContext.baseline !== "") {
 	fail("--require-change requires a clean delegated worktree");
 }
+const primeVersion = readPrimeVersion();
 
 const workerRules = [
 	"You are a delegated coding worker. Work only in cwd.",
@@ -387,24 +438,47 @@ const auditTaskContract = [...workerRules, "", "TASK:", prompt].join("\n");
 writeFileSync(workerPromptPath, `${auditTaskContract}\n`, "utf8");
 
 let primeTask;
-if (prompt.length <= INLINE_TASK_MAX_CHARS) {
-	primeTask = [...workerRules, "", "TASK:", prompt].join("\n");
+let taskPartCount = 0;
+let maxTaskPartBytes = 0;
+const taskBytes = Buffer.byteLength(prompt, "utf8");
+const effectiveTaskContractBytes = Buffer.byteLength(auditTaskContract, "utf8");
+let transportMode;
+if (effectiveTaskContractBytes <= INLINE_TASK_MAX_BYTES) {
+	transportMode = "inline";
+	primeTask = auditTaskContract;
 } else {
+	transportMode = "task-parts";
 	const taskPartsDir = join(outDir, "task-parts");
 	mkdirSync(taskPartsDir, { recursive: true });
-	for (let offset = 0, part = 1; offset < prompt.length; offset += TASK_CHUNK_CHARS, part++) {
-		const name = `part-${String(part).padStart(3, "0")}.txt`;
-		writeFileSync(join(taskPartsDir, name), prompt.slice(offset, offset + TASK_CHUNK_CHARS), "utf8");
-	}
+	const taskParts = splitUtf8ByBytes(prompt, TASK_CHUNK_MAX_BYTES).map((content, index) => {
+		const name = `part-${String(index + 1).padStart(3, "0")}.txt`;
+		const bytes = Buffer.byteLength(content, "utf8");
+		writeFileSync(join(taskPartsDir, name), content, "utf8");
+		return { order: index + 1, name, bytes, sha256: createHash("sha256").update(content, "utf8").digest("hex") };
+	});
+	taskPartCount = taskParts.length;
+	maxTaskPartBytes = Math.max(...taskParts.map((part) => part.bytes), 0);
+	const taskManifestPath = join(taskPartsDir, "manifest.json");
+	writeFileSync(taskManifestPath, `${JSON.stringify({ schemaVersion: 1, taskBytes, maxPartBytes: TASK_CHUNK_MAX_BYTES, parts: taskParts }, null, 2)}\n`, "utf8");
 	const wslTaskPartsDir = toWslPath(taskPartsDir);
 	primeTask = [
 		...workerRules,
 		"",
-		`TASK DETAILS: ${wslTaskPartsDir}/part-*.txt`,
-		"Read each part exactly once, one file per tool call, in lexical order. Never print multiple parts together.",
+		`TASK MANIFEST: ${wslTaskPartsDir}/manifest.json`,
+		"Read the manifest, then read each exact listed part once in order, one file per tool call.",
 		"After the last part, implement the task immediately.",
 	].join("\n");
 }
+const transport = {
+	mode: transportMode,
+	taskBytes,
+	effectiveTaskContractBytes,
+	effectiveInitialPromptBytes: Buffer.byteLength(primeTask, "utf8"),
+	inlineByteLimit: INLINE_TASK_MAX_BYTES,
+	partByteLimit: TASK_CHUNK_MAX_BYTES,
+	partCount: taskPartCount,
+	maxPartBytes: maxTaskPartBytes,
+};
 
 function buildRuntimeEnvironment() {
 	if (!WSL_MODE) return [];
@@ -484,6 +558,9 @@ let parseErrors = 0;
 let attemptEventCount = 0;
 let attemptStderrBytes = 0;
 let attemptStderrPreview = "";
+let attemptProtocol = createProtocolState();
+let finalProtocol = evaluateProtocol(attemptProtocol);
+let lastClassification = null;
 let firstEventSeen = false;
 let attemptClosed = true;
 let pendingCondition = null;
@@ -526,6 +603,7 @@ function processEventLine(rawLine) {
 		const event = JSON.parse(line);
 		eventCount++;
 		attemptEventCount++;
+		recordProtocolEvent(attemptProtocol, event);
 		if (event.type === "message_end") finalText = assistantText(event.message) || finalText;
 		if (event.type === "agent_end" && Array.isArray(event.messages)) {
 			for (const message of event.messages) finalText = assistantText(message) || finalText;
@@ -539,6 +617,7 @@ function processEventLine(rawLine) {
 		onValidEvent(event);
 	} catch {
 		parseErrors++;
+		recordProtocolParseError(attemptProtocol);
 		events.write(`${JSON.stringify({ type: "parse_error", preview: line.slice(0, 500) })}\n`);
 		persistedEventCount++;
 	}
@@ -667,6 +746,7 @@ function spawnAttempt() {
 	attemptEventCount = 0;
 	attemptStderrBytes = 0;
 	attemptStderrPreview = "";
+	attemptProtocol = createProtocolState();
 	firstEventSeen = false;
 	attemptClosed = false;
 	pendingCondition = null;
@@ -748,6 +828,7 @@ function onChildClose(code, signal) {
 	clearTimeout(noChangeTimer);
 	noChangeTimer = null;
 
+	const protocol = evaluateProtocol(attemptProtocol);
 	const classification = classifyChildExit({
 		exitCode: code,
 		signal,
@@ -756,7 +837,10 @@ function onChildClose(code, signal) {
 		watchdogCondition: pendingCondition,
 		timedOut,
 		spawnFailed,
+		protocolComplete: protocol.complete,
 	});
+	finalProtocol = protocol;
+	lastClassification = classification;
 
 	attempts[attempts.length - 1] = {
 		...attempts[attempts.length - 1],
@@ -766,6 +850,7 @@ function onChildClose(code, signal) {
 		eventCount: attemptEventCount,
 		kind: classification.kind,
 		reason: classification.reason,
+		protocol,
 	};
 	lastChildExitCode = code;
 	lastChildSignal = signal;
@@ -845,9 +930,19 @@ function finalize(status, reason, decisionReason, worktreeDiff) {
 
 	const finishedAt = new Date().toISOString();
 	const summary = {
+		schemaVersion: SUMMARY_SCHEMA_VERSION,
+		runId,
+		delegateVersion: DELEGATE_VERSION,
+		primeVersion,
+		taskId: runMetadata.taskId,
+		workPackageId: runMetadata.workPackageId,
+		taskType: runMetadata.taskType,
+		delegationMode: runMetadata.delegationMode,
 		status,
 		terminalReason,
 		decisionReason,
+		failureClass: lastClassification?.failureClass ?? (status === STATUS.COMPLETED ? null : "unknown"),
+		failureOwner: lastClassification?.failureOwner ?? (status === STATUS.COMPLETED ? null : "unknown"),
 		exitCode: lastChildExitCode,
 		signal: lastChildSignal,
 		startedAt,
@@ -872,7 +967,10 @@ function finalize(status, reason, decisionReason, worktreeDiff) {
 		wslCwd,
 		gitContextMode: gitContext.mode,
 		promptFile,
-		eventCaptureMode: options.fullEvents ? "full" : "compact",
+		eventCaptureMode: options.fullEvents ? "full" : "semantic-compact",
+		transport,
+		protocolComplete: finalProtocol.complete,
+		protocol: finalProtocol,
 		requireChange: options.requireChange,
 		allowedChanges: options.allowedChanges,
 		eventCount,

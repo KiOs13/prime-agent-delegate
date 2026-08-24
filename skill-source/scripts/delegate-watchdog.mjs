@@ -14,6 +14,8 @@ import { spawnSync } from "node:child_process";
 import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 
 export const SCHEMA_VERSION = 1;
+export const SUMMARY_SCHEMA_VERSION = 2;
+export const DELEGATE_VERSION = "2.0.0";
 
 export const STATUS = Object.freeze({
 	STARTING: "starting",
@@ -32,6 +34,146 @@ export const FAILURE_KIND = Object.freeze({
 	EXIT_BEFORE_FIRST_EVENT: "exit_before_first_event",
 	NO_CHANGE_PROGRESS: "no_change_progress",
 });
+
+const ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+const TASK_TYPES = new Set(["implementation", "investigation", "testing", "prototype"]);
+const DELEGATION_MODES = new Set(["implement", "prototype", "investigate"]);
+
+export function validateMetadataValue(value, { name, allowed } = {}) {
+	if (value == null) return null;
+	if (allowed) {
+		if (!allowed.has(value)) throw new RangeError(`${name} must be one of: ${[...allowed].join(", ")}`);
+		return value;
+	}
+	if (!ID_PATTERN.test(value)) throw new RangeError(`${name} must match [A-Za-z0-9._-]{1,128}`);
+	return value;
+}
+
+export function normalizeRunMetadata(options = {}) {
+	const delegationMode = validateMetadataValue(
+		options.delegationMode ?? (options.autonomous ? "implement" : "investigate"),
+		{ name: "--delegation-mode", allowed: DELEGATION_MODES },
+	);
+	const taskType = validateMetadataValue(
+		options.taskType ?? (options.autonomous ? "implementation" : "investigation"),
+		{ name: "--task-type", allowed: TASK_TYPES },
+	);
+	if (delegationMode === "implement" && (!options.autonomous || !options.requireChange)) {
+		throw new RangeError("implement mode requires --autonomous --require-change");
+	}
+	if (delegationMode === "investigate" && options.requireChange) {
+		throw new RangeError("investigate mode is incompatible with --require-change");
+	}
+	return {
+		taskId: validateMetadataValue(options.taskId, { name: "--task-id" }),
+		workPackageId: validateMetadataValue(options.workPackageId, { name: "--work-package-id" }),
+		taskType,
+		delegationMode,
+	};
+}
+
+export function splitUtf8ByBytes(value, maxBytes) {
+	if (!Number.isInteger(maxBytes) || maxBytes < 1) throw new RangeError("maxBytes must be a positive integer");
+	const parts = [];
+	let current = "";
+	let currentBytes = 0;
+	for (const codePoint of String(value)) {
+		const bytes = Buffer.byteLength(codePoint, "utf8");
+		if (bytes > maxBytes) throw new RangeError("maxBytes is smaller than one Unicode code point");
+		if (current && currentBytes + bytes > maxBytes) {
+			parts.push(current);
+			current = "";
+			currentBytes = 0;
+		}
+		current += codePoint;
+		currentBytes += bytes;
+	}
+	if (current || parts.length === 0) parts.push(current);
+	return parts;
+}
+
+export function createProtocolState() {
+	return {
+		sessionCount: 0,
+		sessionVersion: null,
+		agentStartCount: 0,
+		agentEndCount: 0,
+		openTurns: 0,
+		turnStartCount: 0,
+		turnEndCount: 0,
+		openToolCalls: new Set(),
+		duplicateToolStarts: 0,
+		unmatchedToolEnds: 0,
+		malformedLines: 0,
+	};
+}
+
+export function recordProtocolEvent(state, event) {
+	switch (event?.type) {
+		case "session":
+			state.sessionCount++;
+			state.sessionVersion ??= event.version ?? null;
+			break;
+		case "agent_start":
+			state.agentStartCount++;
+			break;
+		case "agent_end":
+			state.agentEndCount++;
+			break;
+		case "turn_start":
+			state.turnStartCount++;
+			state.openTurns++;
+			break;
+		case "turn_end":
+			state.turnEndCount++;
+			state.openTurns--;
+			break;
+		case "tool_execution_start":
+			if (!event.toolCallId || state.openToolCalls.has(event.toolCallId)) state.duplicateToolStarts++;
+			else state.openToolCalls.add(event.toolCallId);
+			break;
+		case "tool_execution_end":
+			if (!event.toolCallId || !state.openToolCalls.delete(event.toolCallId)) state.unmatchedToolEnds++;
+			break;
+	}
+	return state;
+}
+
+export function recordProtocolParseError(state) {
+	state.malformedLines++;
+	return state;
+}
+
+export function evaluateProtocol(state) {
+	const complete =
+		state.sessionCount === 1 &&
+		state.agentStartCount === 1 &&
+		state.agentEndCount === 1 &&
+		state.openTurns === 0 &&
+		state.turnStartCount === state.turnEndCount &&
+		state.openToolCalls.size === 0 &&
+		state.duplicateToolStarts === 0 &&
+		state.unmatchedToolEnds === 0 &&
+		state.malformedLines === 0;
+	return {
+		complete,
+		sessionCount: state.sessionCount,
+		sessionVersion: state.sessionVersion,
+		agentStartCount: state.agentStartCount,
+		agentEndCount: state.agentEndCount,
+		turnStartCount: state.turnStartCount,
+		turnEndCount: state.turnEndCount,
+		openTurnCount: state.openTurns,
+		openToolCallCount: state.openToolCalls.size,
+		duplicateToolStarts: state.duplicateToolStarts,
+		unmatchedToolEnds: state.unmatchedToolEnds,
+		malformedLines: state.malformedLines,
+	};
+}
+
+function result(kind, reason, terminalStatus, failureClass, failureOwner) {
+	return { kind, reason, terminalStatus, failureClass, failureOwner };
+}
 
 export const TERMINAL_STATUSES = Object.freeze([
 	STATUS.COMPLETED,
@@ -180,39 +322,52 @@ export function classifyChildExit({
 	watchdogCondition = null,
 	timedOut = false,
 	spawnFailed = false,
+	protocolComplete = true,
 } = {}) {
 	if (timedOut) {
-		return { kind: "timed_out", reason: "overall_timeout", terminalStatus: STATUS.TIMED_OUT };
+		return result("timed_out", "overall_timeout", STATUS.TIMED_OUT, "timeout", "delegate_skill");
 	}
 	if (watchdogCondition === FAILURE_KIND.STARTUP_TIMEOUT) {
-		return { kind: FAILURE_KIND.STARTUP_TIMEOUT, reason: "no_valid_event_within_startup_grace" };
+		return result(FAILURE_KIND.STARTUP_TIMEOUT, "no_valid_event_within_startup_grace", undefined, "startup", "environment");
 	}
 	if (watchdogCondition === FAILURE_KIND.IDLE_TIMEOUT) {
-		return { kind: FAILURE_KIND.IDLE_TIMEOUT, reason: "no_valid_event_within_idle_timeout" };
+		return result(FAILURE_KIND.IDLE_TIMEOUT, "no_valid_event_within_idle_timeout", undefined, "idle", "environment");
 	}
 	if (watchdogCondition === FAILURE_KIND.NO_CHANGE_PROGRESS) {
-		return { kind: "failed", reason: FAILURE_KIND.NO_CHANGE_PROGRESS, terminalStatus: STATUS.FAILED };
+		return result("failed", FAILURE_KIND.NO_CHANGE_PROGRESS, STATUS.FAILED, "no_progress", "prime_agent");
 	}
 	if (spawnFailed) {
-		return { kind: "config_error", reason: "spawn_error", terminalStatus: STATUS.FAILED };
+		return result("config_error", "spawn_error", STATUS.FAILED, "spawn", "environment");
 	}
 	if (exitCode === 0) {
-		return { kind: "completed", reason: "normal_exit", terminalStatus: STATUS.COMPLETED };
+		return protocolComplete
+			? result("completed", "normal_exit", STATUS.COMPLETED, null, null)
+			: result("failed", "protocol_incomplete", STATUS.FAILED, "protocol", "prime_agent");
 	}
 	if (signal) {
-		return { kind: "failed", reason: `terminated_by_signal_${signal}`, terminalStatus: STATUS.FAILED };
+		return result("failed", `terminated_by_signal_${signal}`, STATUS.FAILED, "process", "environment");
 	}
 	if (attemptEventCount > 0) {
+		const reason = primeFailureReason(stderrPreview) ?? "nonzero_exit_after_event";
+		if (reason === "provider_rate_limited" || reason === "provider_unavailable") {
+			return result("failed", reason, STATUS.FAILED, "provider", "provider");
+		}
+		if (reason === "gate_failed") return result("failed", reason, STATUS.FAILED, "gate", "project");
+		if (reason?.endsWith("_exhausted") || reason === "prime_timeout") {
+			return result("failed", reason, STATUS.FAILED, "prime_limit", "prime_agent");
+		}
 		return {
 			kind: "failed",
-			reason: primeFailureReason(stderrPreview) ?? "nonzero_exit_after_event",
+			reason,
 			terminalStatus: STATUS.FAILED,
+			failureClass: "execution",
+			failureOwner: "unknown",
 		};
 	}
 	if (isKnownConfigurationError(stderrPreview)) {
-		return { kind: "config_error", reason: "nonzero_exit_before_event_with_stderr", terminalStatus: STATUS.FAILED };
+		return result("config_error", "nonzero_exit_before_event_with_stderr", STATUS.FAILED, "configuration", "delegate_skill");
 	}
-	return { kind: FAILURE_KIND.EXIT_BEFORE_FIRST_EVENT, reason: "nonzero_exit_before_first_event" };
+	return result(FAILURE_KIND.EXIT_BEFORE_FIRST_EVENT, "nonzero_exit_before_first_event", undefined, "startup", "environment");
 }
 
 export function primeFailureReason(stderrPreview) {
@@ -223,6 +378,8 @@ export function primeFailureReason(stderrPreview) {
 	if (/maxContinuations reached/i.test(text)) return "max_continuations_exhausted";
 	if (/timeoutMs reached/i.test(text)) return "prime_timeout";
 	if (/Autonomous quality gate still failing/i.test(text)) return "gate_failed";
+	if (/(?:HTTP\s*)?429|rate.?limit/i.test(text)) return "provider_rate_limited";
+	if (/(?:HTTP\s*)?503|service unavailable/i.test(text)) return "provider_unavailable";
 	return null;
 }
 

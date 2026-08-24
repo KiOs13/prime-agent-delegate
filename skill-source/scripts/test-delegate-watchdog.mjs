@@ -13,27 +13,35 @@ import { join } from "node:path";
 import {
 	FAILURE_KIND,
 	SCHEMA_VERSION,
+	SUMMARY_SCHEMA_VERSION,
+	DELEGATE_VERSION,
 	STATUS,
 	atomicWriteJson,
 	buildWorkerPromptArgument,
 	classifyChildExit,
+	createProtocolState,
 	createHealth,
 	decodeCapturedOutput,
 	decideRestart,
 	evaluateHealthStatus,
+	evaluateProtocol,
 	healthHeartbeatAge,
 	isInfraFailure,
 	isKnownConfigurationError,
 	isLinuxProcessRunningFromStat,
 	isTerminal,
+	normalizeRunMetadata,
 	parseIntegerOption,
 	primeFailureReason,
 	readHealth,
 	recordAttemptStart,
+	recordProtocolEvent,
+	recordProtocolParseError,
 	recordRestarting,
 	recordTerminal,
 	recordValidEvent,
 	shouldStopForNoChange,
+	splitUtf8ByBytes,
 	terminalStatusFor,
 } from "./delegate-watchdog.mjs";
 
@@ -133,6 +141,83 @@ test("worker receives the task contract inline without an @file lookup", () => {
 		"Implement the bounded task.",
 	);
 	assert.throws(() => buildWorkerPromptArgument({ workerPrompt: "  " }), /non-empty string/);
+});
+
+test("V2 metadata defaults and validation", () => {
+	assert.equal(SUMMARY_SCHEMA_VERSION, 2);
+	assert.equal(DELEGATE_VERSION, "2.0.0");
+	assert.deepEqual(normalizeRunMetadata({ autonomous: false, requireChange: false }), {
+		taskId: null,
+		workPackageId: null,
+		taskType: "investigation",
+		delegationMode: "investigate",
+	});
+	assert.deepEqual(normalizeRunMetadata({
+		autonomous: true,
+		requireChange: true,
+		taskId: "T053",
+		workPackageId: "wp.transport-1",
+		taskType: "implementation",
+		delegationMode: "implement",
+	}), {
+		taskId: "T053",
+		workPackageId: "wp.transport-1",
+		taskType: "implementation",
+		delegationMode: "implement",
+	});
+	assert.throws(() => normalizeRunMetadata({ delegationMode: "implement", autonomous: false }), /requires/);
+	assert.throws(() => normalizeRunMetadata({ delegationMode: "investigate", requireChange: true }), /incompatible/);
+	assert.throws(() => normalizeRunMetadata({ taskId: "../bad" }), /must match/);
+	assert.throws(() => normalizeRunMetadata({ taskType: "unknown" }), /must be one of/);
+});
+
+test("UTF-8 byte splitting preserves Unicode code points and limits", () => {
+	const value = "abc Привет 世界 😀 xyz";
+	const parts = splitUtf8ByBytes(value, 8);
+	assert.equal(parts.join(""), value);
+	for (const part of parts) assert.ok(Buffer.byteLength(part, "utf8") <= 8);
+	assert.deepEqual(splitUtf8ByBytes("😀😀", 4), ["😀", "😀"]);
+	assert.throws(() => splitUtf8ByBytes("😀", 3), /smaller than one Unicode code point/);
+});
+
+test("protocol lifecycle requires complete balanced evidence", () => {
+	const state = createProtocolState();
+	for (const event of [
+		{ type: "session", version: 3 },
+		{ type: "agent_start" },
+		{ type: "turn_start" },
+		{ type: "tool_execution_start", toolCallId: "call-1" },
+		{ type: "tool_execution_end", toolCallId: "call-1" },
+		{ type: "turn_end" },
+		{ type: "agent_end" },
+	]) recordProtocolEvent(state, event);
+	assert.deepEqual(evaluateProtocol(state), {
+		complete: true,
+		sessionCount: 1,
+		sessionVersion: 3,
+		agentStartCount: 1,
+		agentEndCount: 1,
+		turnStartCount: 1,
+		turnEndCount: 1,
+		openTurnCount: 0,
+		openToolCallCount: 0,
+		duplicateToolStarts: 0,
+		unmatchedToolEnds: 0,
+		malformedLines: 0,
+	});
+	recordProtocolParseError(state);
+	assert.equal(evaluateProtocol(state).complete, false);
+});
+
+test("protocol detects missing terminal and unmatched tools", () => {
+	const state = createProtocolState();
+	recordProtocolEvent(state, { type: "session", version: 3 });
+	recordProtocolEvent(state, { type: "agent_start" });
+	recordProtocolEvent(state, { type: "tool_execution_end", toolCallId: "missing" });
+	const result = evaluateProtocol(state);
+	assert.equal(result.complete, false);
+	assert.equal(result.agentEndCount, 0);
+	assert.equal(result.unmatchedToolEnds, 1);
 });
 
 test("Linux process stat treats zombies as terminated", () => {
@@ -260,6 +345,27 @@ test("Prime autonomous failures have precise terminal reasons", () => {
 		assert.equal(cls.terminalStatus, STATUS.FAILED);
 	}
 	assert.equal(primeFailureReason("ordinary process error"), null);
+});
+
+test("provider failures are classified deterministically", () => {
+	for (const [stderrPreview, reason] of [
+		["HTTP 429 rate limit exceeded", "provider_rate_limited"],
+		["503 Service Unavailable", "provider_unavailable"],
+	]) {
+		const cls = classifyChildExit({ exitCode: 1, attemptEventCount: 1, stderrPreview });
+		assert.equal(cls.reason, reason);
+		assert.equal(cls.failureClass, "provider");
+		assert.equal(cls.failureOwner, "provider");
+	}
+});
+
+test("exit zero requires complete protocol evidence", () => {
+	const cls = classifyChildExit({ exitCode: 0, attemptEventCount: 3, protocolComplete: false });
+	assert.equal(cls.kind, "failed");
+	assert.equal(cls.reason, "protocol_incomplete");
+	assert.equal(cls.terminalStatus, STATUS.FAILED);
+	assert.equal(cls.failureClass, "protocol");
+	assert.equal(cls.failureOwner, "prime_agent");
 });
 
 test("normal exit does not restart", () => {
