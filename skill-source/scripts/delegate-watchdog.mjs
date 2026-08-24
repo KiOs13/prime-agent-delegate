@@ -352,6 +352,7 @@ export function classifyChildExit({
 		if (reason === "provider_rate_limited" || reason === "provider_unavailable" || reason === "provider_network_error") {
 			return result("failed", reason, STATUS.FAILED, "provider", "provider");
 		}
+		if (reason === "task_contract_invalid") return result("failed", reason, STATUS.FAILED, "contract", "task_spec");
 		if (reason === "gate_failed") return result("failed", reason, STATUS.FAILED, "gate", "project");
 		if (reason?.endsWith("_exhausted") || reason === "prime_timeout") {
 			return result("failed", reason, STATUS.FAILED, "prime_limit", "prime_agent");
@@ -378,6 +379,7 @@ export function primeFailureReason(stderrPreview) {
 	if (/maxContinuations reached/i.test(text)) return "max_continuations_exhausted";
 	if (/timeoutMs reached/i.test(text)) return "prime_timeout";
 	if (/Autonomous quality gate still failing/i.test(text)) return "gate_failed";
+	if (/\b(?:invalid|malformed) task contract\b/i.test(text)) return "task_contract_invalid";
 	if (/(?:HTTP\s*)?429|rate.?limit/i.test(text)) return "provider_rate_limited";
 	if (/(?:HTTP\s*)?503|service unavailable/i.test(text)) return "provider_unavailable";
 	if (/\b(?:ECONNRESET|ENOTFOUND|EAI_AGAIN|ETIMEDOUT)\b/i.test(text)) return "provider_network_error";

@@ -902,7 +902,7 @@ function onChildClose(code, signal) {
 				reason: porcelainResult.error,
 				terminalStatus: STATUS.FAILED,
 				failureClass: "git",
-				failureOwner: "environment",
+				failureOwner: "delegate_skill",
 			};
 			finalize(STATUS.FAILED, porcelainResult.error, "git_status_failed");
 			return;

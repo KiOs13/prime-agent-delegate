@@ -46,6 +46,12 @@ if (scenario === "provider-429" || scenario === "provider-503") {
 	process.stderr.write(scenario === "provider-429" ? "HTTP 429 rate limit exceeded\n" : "HTTP 503 Service Unavailable\n");
 	process.exit(1);
 }
+if (scenario === "task-spec") {
+	emit({ type: "session", version: 1 });
+	emit({ type: "agent_start" });
+	process.stderr.write("Invalid task contract\n");
+	process.exit(1);
+}
 if (scenario === "malformed") {
 	for (const event of normal) emit(event);
 	process.stdout.write("{malformed\n");

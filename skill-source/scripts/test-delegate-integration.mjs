@@ -175,6 +175,17 @@ test("provider evidence is classified without retry", () => {
 	}
 });
 
+test("invalid task contract is owned by task_spec", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "task-spec");
+	const result = runDelegate({ cwd, outDir, scenario: "task-spec", prompt: "invalid contract fixture" });
+	assert.equal(result.status, 1);
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.terminalReason, "task_contract_invalid");
+	assert.equal(summary.failureOwner, "task_spec");
+	assert.equal(summary.restartCount, 0);
+});
+
 test("Git ignore is fail-closed while an external out-dir remains valid", () => {
 	const cwd = createRepo({ ignored: false });
 	const internal = join(cwd, ".prime-delegate", "runs", "blocked");

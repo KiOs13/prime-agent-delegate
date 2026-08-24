@@ -360,6 +360,17 @@ test("provider failures are classified deterministically", () => {
 	}
 });
 
+test("invalid task contract has task_spec ownership", () => {
+	const cls = classifyChildExit({
+		exitCode: 1,
+		attemptEventCount: 1,
+		stderrPreview: "Invalid task contract",
+	});
+	assert.equal(cls.reason, "task_contract_invalid");
+	assert.equal(cls.failureClass, "contract");
+	assert.equal(cls.failureOwner, "task_spec");
+});
+
 test("exit zero requires complete protocol evidence", () => {
 	const cls = classifyChildExit({ exitCode: 0, attemptEventCount: 3, protocolComplete: false });
 	assert.equal(cls.kind, "failed");
