@@ -2,9 +2,10 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { sanitize } from "./sanitize.mjs";
 import {
 	FAILURE_KIND,
 	STATUS,
@@ -270,6 +271,27 @@ function ensureOutputIgnored({ cwd, wslCwd, outDir, gitContext }) {
 	if (result.status !== 0) fail(`Output path inside the worktree must be ignored by Git: ${relativeOut}`);
 }
 
+function artifactEntries(runDir, manifestPath) {
+	const entries = [];
+	const visit = (directory) => {
+		for (const entry of readdirSync(directory, { withFileTypes: true })) {
+			const path = join(directory, entry.name);
+			if (path === manifestPath) continue;
+			if (entry.isDirectory()) visit(path);
+			else if (entry.isFile()) {
+				const content = readFileSync(path);
+				entries.push({
+					path: relative(runDir, path).replaceAll("\\", "/"),
+					bytes: content.length,
+					sha256: createHash("sha256").update(content).digest("hex"),
+				});
+			}
+		}
+	};
+	visit(runDir);
+	return entries.sort((left, right) => left.path.localeCompare(right.path));
+}
+
 function assistantText(message) {
 	if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return "";
 	return message.content
@@ -417,6 +439,7 @@ const summaryPath = join(outDir, "summary.json");
 const auditSummaryPath = join(outDir, "audit-summary.json");
 const workerPromptPath = join(outDir, "worker-prompt.md");
 const healthPath = join(outDir, "health.json");
+const runManifestPath = join(outDir, "run-manifest.json");
 const runtimeBinDir = join(outDir, "runtime-bin");
 const events = createWriteStream(eventsPath, { encoding: "utf8" });
 const errors = createWriteStream(stderrPath, { encoding: "utf8" });
@@ -980,7 +1003,7 @@ function finalize(status, reason, decisionReason, worktreeDiff) {
 		finalText,
 		worktreeDiff,
 		healthPath,
-		artifacts: { eventsPath, stderrPath, summaryPath, auditSummaryPath, workerPromptPath, healthPath },
+		artifacts: { eventsPath, stderrPath, summaryPath, auditSummaryPath, workerPromptPath, healthPath, runManifestPath },
 	};
 	writeFileSync(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
 	let pendingStreams = 2;
@@ -998,6 +1021,39 @@ function finalize(status, reason, decisionReason, worktreeDiff) {
 		summary.auditSummaryStatus = audit.status === 0 ? "created" : "failed";
 		if (audit.status !== 0) summary.auditSummaryError = (audit.stderr || audit.stdout).trim().slice(0, 1000);
 		writeFileSync(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
+		const auditSummary = audit.status === 0 ? JSON.parse(readFileSync(auditSummaryPath, "utf8")) : {};
+		const artifacts = artifactEntries(outDir, runManifestPath);
+		const eventsArtifact = artifacts.find((artifact) => artifact.path === "events.jsonl");
+		atomicWriteJson(runManifestPath, sanitize({
+			schemaVersion: 1,
+			runId,
+			completed: true,
+			generatedAt: new Date().toISOString(),
+			run: {
+				status: summary.status,
+				terminalReason: summary.terminalReason,
+				failureClass: summary.failureClass,
+				failureOwner: summary.failureOwner,
+				taskId: summary.taskId,
+				workPackageId: summary.workPackageId,
+				taskType: summary.taskType,
+				delegationMode: summary.delegationMode,
+				delegateVersion: summary.delegateVersion,
+				primeVersion: summary.primeVersion,
+			},
+			captureMode: summary.eventCaptureMode,
+			primeEventSchemaVersion: finalProtocol.sessionVersion,
+			eventCounts: {
+				total: eventCount,
+				persisted: persistedEventCount,
+				dropped: droppedStreamingEventCount,
+				byType: auditSummary.eventTypes ?? {},
+			},
+			protocolEvidence: finalProtocol,
+			refineSourceAvailable: finalProtocol.sessionCount === 1 && Boolean(eventsArtifact?.bytes),
+			eventsSha256: eventsArtifact?.sha256 ?? null,
+			artifacts,
+		}));
 		process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
 		process.exit(finalExitCode);
 	};

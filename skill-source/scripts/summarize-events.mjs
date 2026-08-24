@@ -2,6 +2,7 @@
 
 import { createReadStream, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
+import { sanitize, sanitizeString } from "./sanitize.mjs";
 
 const MAX_ITEMS = 40;
 
@@ -25,12 +26,6 @@ function parseArgs(argv) {
 	return options;
 }
 
-function redact(value) {
-	return String(value ?? "")
-		.replace(/\b(Bearer)\s+[^\s"']+/gi, "$1 [REDACTED]")
-		.replace(/\b(api[_-]?key|authorization|password|passwd|token|secret)\b\s*[:=]\s*(["']?)[^\s,"'}]+\2/gi, "$1=[REDACTED]");
-}
-
 function compact(value, limit = 1200) {
 	let text;
 	try {
@@ -38,7 +33,7 @@ function compact(value, limit = 1200) {
 	} catch {
 		text = String(value);
 	}
-	text = redact(text).replace(/\s+/g, " ").trim();
+	text = sanitizeString(text).replace(/\s+/g, " ").trim();
 	return text.length <= limit ? text : `${text.slice(0, limit)}...`;
 }
 
@@ -164,4 +159,4 @@ const audit = {
 	],
 };
 
-writeFileSync(options.output, `${JSON.stringify(audit, null, 2)}\n`, "utf8");
+writeFileSync(options.output, `${JSON.stringify(sanitize(audit), null, 2)}\n`, "utf8");
