@@ -56,7 +56,6 @@ const DEFAULT_NO_CHANGE_TIMEOUT_MS = 600000;
 const DEFAULT_NO_CHANGE_MAX_TOOL_CALLS = 80;
 const DEFAULT_REPEATED_TOOL_FAILURE_LIMIT = 8;
 const DEFAULT_AUTONOMOUS_MAX_CONTINUATIONS = 3;
-const DEFAULT_AUTONOMOUS_MAX_TURNS = 12;
 const DEFAULT_AUTONOMOUS_MAX_TOKENS = 1000000;
 const INLINE_TASK_MAX_BYTES = 1024;
 const TASK_CHUNK_MAX_BYTES = 600;
@@ -438,7 +437,9 @@ const repeatedToolFailureLimit = parseIntOption(
 	{ min: 1 },
 );
 const autonomousMaxContinuations = parseIntOption(options.autonomousMaxContinuations ?? DEFAULT_AUTONOMOUS_MAX_CONTINUATIONS, "--autonomous-max-continuations", { min: 1 });
-const autonomousMaxTurns = parseIntOption(options.autonomousMaxTurns ?? DEFAULT_AUTONOMOUS_MAX_TURNS, "--autonomous-max-turns", { min: 1 });
+const autonomousMaxTurns = options.autonomousMaxTurns === undefined
+	? null
+	: parseIntOption(options.autonomousMaxTurns, "--autonomous-max-turns", { min: 1 });
 const autonomousMaxTokens = parseIntOption(options.autonomousMaxTokens ?? DEFAULT_AUTONOMOUS_MAX_TOKENS, "--autonomous-max-tokens", { min: 1 });
 
 const prompt = readFileSync(promptFile, "utf8").trim();
@@ -447,10 +448,12 @@ if (!prompt) fail("--prompt-file is empty");
 const workerRules = [
 	"You are a delegated coding worker. Work only in cwd.",
 	"Do not commit, push, deploy, alter credentials, or perform destructive cleanup.",
-	"Use targeted reads. Do not open worker-prompt.md; it is only an audit artifact.",
+	"For split tasks, read the manifest and every ordered part in one tool call.",
+	"Use targeted reads and batch independent reads in one tool call. Do not open worker-prompt.md; it is only an audit artifact.",
+	"Once a target range is found, do not reread overlapping ranges unless earlier output was missing.",
 	"Run only focused checks for the bounded change. Leave full integration and regression suites to Codex after this worker session exits.",
 	options.requireChange
-		? `Make the first allowed edit within ${noChangeTimeoutMs} ms or ${noChangeMaxToolCalls} tool calls.`
+		? `After locating the target, make the first allowed edit before further broad exploration and within ${noChangeTimeoutMs} ms or ${noChangeMaxToolCalls} tool calls.`
 		: "Do not edit unless the task explicitly requests it.",
 	options.autonomous ? "The host runs final gates. Return changed files, checks, and blockers." : "Return one concise final report.",
 ];
@@ -508,7 +511,7 @@ if (options.noTools) {
 	const wslTaskPartsDir = toWslPath(taskPartsDir);
 	primeTask = [
 		`TASK MANIFEST: ${wslTaskPartsDir}/manifest.json`,
-		"Read the manifest, then read each exact listed part once in order, one file per tool call.",
+		"Read the manifest and every exact listed part once in order in one tool call.",
 		"After the last part, implement the task immediately.",
 		"",
 		...workerRules,
@@ -557,7 +560,7 @@ function buildPrimeArgs() {
 	if (options.autonomous) {
 		primeArgs.push("--autonomous");
 		primeArgs.push("--autonomous-max-continuations", String(autonomousMaxContinuations));
-		primeArgs.push("--autonomous-max-turns", String(autonomousMaxTurns));
+		if (autonomousMaxTurns !== null) primeArgs.push("--autonomous-max-turns", String(autonomousMaxTurns));
 		primeArgs.push("--autonomous-max-tokens", String(autonomousMaxTokens));
 		primeArgs.push("--autonomous-timeout-ms", String(timeoutMs));
 		for (const gate of options.autonomousGates) primeArgs.push("--autonomous-gate", gate);
@@ -749,7 +752,7 @@ function onValidEvent(event) {
 	const toolCall = event?.type === "tool_execution_start";
 	const turnStart = event?.type === "turn_start";
 	health = recordValidEvent(health, { now, toolCall, turnStart });
-	if (options.autonomous && turnStart && health.attemptTurnCount > autonomousMaxTurns) {
+	if (options.autonomous && autonomousMaxTurns !== null && turnStart && health.attemptTurnCount > autonomousMaxTurns) {
 		pendingCondition = FAILURE_KIND.MAX_TURNS_EXHAUSTED;
 		appendSyntheticEvent({
 			kind: FAILURE_KIND.MAX_TURNS_EXHAUSTED,

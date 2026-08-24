@@ -146,7 +146,7 @@ Defaults:
 | `--no-change-max-tool-calls` | 80 |
 | `--repeated-tool-failure-limit` | 8 |
 | `--autonomous-max-continuations` | 3 |
-| `--autonomous-max-turns` | 12 |
+| `--autonomous-max-turns` | disabled |
 | `--autonomous-max-tokens` | 1000000 |
 
 Only startup silence, idle silence, or nonzero exit before the first valid event
@@ -157,9 +157,11 @@ consecutive identical failed tool completions as `repeated_tool_failure`
 (`tool_loop`, owned by `prime_agent`) while preserving the partial worktree.
 `--require-change` is also checked by the launcher at process completion; exit
 0 without a worktree change fails as `required_change_missing`.
-For autonomous runs, the launcher independently counts `turn_start` events and
-stops the first turn beyond `--autonomous-max-turns` as
-`max_turns_exhausted`, preserving any partial diff.
+`--autonomous-max-turns <N>` is an optional explicit guard. When set, the
+launcher independently counts `turn_start` events and stops the first turn
+beyond the limit as `max_turns_exhausted`, preserving any partial diff. When
+omitted, the other time, progress, tool-loop, token, and gate watchdogs remain
+active without a launcher turn-count limit.
 At child completion, every changed Git path is also checked exactly against
 all `--allow-change` values. Any extra path fails as `unauthorized_change`
 without deleting the partial worktree.

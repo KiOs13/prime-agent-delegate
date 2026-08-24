@@ -92,10 +92,11 @@ function emitScenario({ includeSession = true } = {}) {
 	if (scenario === "max-turns") {
 		if (includeSession) emit({ type: "session", version: 3 });
 		emit({ type: "agent_start" });
-		for (let index = 1; index <= 6; index++) {
+		for (let index = 1; index <= 15; index++) {
 			emit({ type: "turn_start", turn: index });
 			emit({ type: "turn_end", turn: index });
 		}
+		emit({ type: "agent_end", messages: [] });
 		return;
 	}
 	for (const event of lifecycle) emit(event);

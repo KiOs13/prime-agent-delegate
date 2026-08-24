@@ -82,6 +82,10 @@ test("default RPC uses task-parts for large prompts and seals artifacts", () => 
 		readFileSync(join(outDir, "worker-prompt.md"), "utf8"),
 		/Leave full integration and regression suites to Codex after this worker session exits\./,
 	);
+	assert.match(
+		readFileSync(join(outDir, "worker-prompt.md"), "utf8"),
+		/Batch independent targeted reads|batch independent reads in one tool call/,
+	);
 	const taskManifest = json(join(outDir, "task-parts", "manifest.json"));
 	assert.equal(taskManifest.parts.map((part) => readFileSync(join(outDir, "task-parts", part.name), "utf8")).join(""), prompt);
 	for (const part of taskManifest.parts) assert.equal(sha256(join(outDir, "task-parts", part.name)), part.sha256);
@@ -338,6 +342,29 @@ test("launcher stops autonomous runs on the first turn beyond the configured lim
 	assert.equal(summary.observedTurnCount, 4);
 	assert.equal(summary.restartCount, 0);
 	assert.match(summary.worktreeDiff, /fake-prime-output\.txt/);
+});
+
+test("autonomous runs have no turn limit unless explicitly configured", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "no-max-turns");
+	const result = runDelegate({
+		cwd,
+		outDir,
+		scenario: "max-turns",
+		prompt: "complete a long bounded task without an explicit turn limit",
+		args: [
+			"--autonomous",
+			"--require-change",
+			"--allow-change", "fake-prime-output.txt",
+			"--autonomous-gate", "test -f fake-prime-output.txt",
+			"--delegation-mode", "implement",
+		],
+	});
+	assert.equal(result.status, 0, result.stderr);
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.autonomousMaxTurns, null);
+	assert.equal(summary.observedTurnCount, 15);
+	assert.equal(summary.terminalReason, "normal_exit");
 });
 
 test("launcher rejects changes outside the exact allowlist", () => {
