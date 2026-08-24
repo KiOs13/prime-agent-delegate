@@ -42,6 +42,9 @@ const TEST_MODE = process.env.PRIME_AGENT_DELEGATE_TEST_MODE === "1";
 const PRIME_AGENT = TEST_MODE && process.env.PRIME_AGENT_DELEGATE_TEST_EXEC
 	? process.env.PRIME_AGENT_DELEGATE_TEST_EXEC
 	: "/usr/bin/prime-agent";
+const PRIME_AGENT_COMMAND = TEST_MODE && process.env.PRIME_AGENT_DELEGATE_TEST_EXEC
+	? ["/usr/bin/node", PRIME_AGENT]
+	: [PRIME_AGENT];
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_STARTUP_GRACE_MS = 90000;
 const DEFAULT_IDLE_TIMEOUT_MS = 300000;
@@ -141,11 +144,11 @@ function windowsPathToWslPath(value) {
 
 // --check: version plus daemon/status command reachability. No model inference.
 function checkInstallation() {
-	const versionResult = runLocalSync([PRIME_AGENT + " --version"]);
+	const versionResult = runLocalSync([shellJoin([...PRIME_AGENT_COMMAND, "--version"])]);
 	const version = (versionResult.stdout.trim() || versionResult.stderr.trim()).split(/\r?\n/, 1)[0] ?? "";
 	const versionOk = versionResult.status === 0 && version.length > 0;
 
-	const statusResult = runLocalSync([PRIME_AGENT + " status --json"]);
+	const statusResult = runLocalSync([shellJoin([...PRIME_AGENT_COMMAND, "status", "--json"])]);
 	let statusServices = null;
 	let statusOk = statusResult.status === 0;
 	try {
@@ -176,7 +179,7 @@ function checkInstallation() {
 }
 
 function readPrimeVersion() {
-	const result = runLocalSync([PRIME_AGENT + " --version"]);
+	const result = runLocalSync([shellJoin([...PRIME_AGENT_COMMAND, "--version"])]);
 	const version = (result.stdout.trim() || result.stderr.trim()).split(/\r?\n/, 1)[0] ?? "";
 	if (result.status !== 0 || !version) fail("prime-agent --version failed");
 	return version;
@@ -524,7 +527,7 @@ function buildRuntimeEnvironment() {
 const runtimeEnvironment = buildRuntimeEnvironment();
 
 function buildPrimeArgs() {
-	const primeArgs = [PRIME_AGENT, "--mode", "json", "--no-session", "--cwd", wslCwd];
+	const primeArgs = [...PRIME_AGENT_COMMAND, "--mode", "json", "--no-session", "--cwd", wslCwd];
 	if (options.noTools) primeArgs.push("--no-tools");
 	if (options.provider) primeArgs.push("--provider", options.provider);
 	if (options.model) primeArgs.push("--model", options.model);

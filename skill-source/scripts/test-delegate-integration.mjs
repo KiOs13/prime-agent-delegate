@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -10,7 +10,6 @@ import { fileURLToPath } from "node:url";
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const DELEGATE = join(SCRIPT_DIR, "delegate.mjs");
 const FAKE_PRIME = join(SCRIPT_DIR, "fake-prime-agent.mjs");
-chmodSync(FAKE_PRIME, 0o755);
 
 function createRepo({ ignored = true } = {}) {
 	const cwd = mkdtempSync(join(tmpdir(), "prime-delegate-int-"));
