@@ -169,7 +169,23 @@ event counts, terminal lifecycle evidence, events SHA-256, and
 
 ## UTF-8 transport
 
-Replace character thresholds with UTF-8 byte thresholds.
+Use RPC stdin as the default process-control transport.
+
+- Perform a correlated `get_state` handshake and require a real session id.
+- Persist a synthetic schema-v3 session header with that id before lifecycle
+  events.
+- Send the selected inline or manifest instruction as one strict LF-delimited
+  JSON prompt command and close stdin.
+- Never place RPC task text in argv or a shell command.
+- Filter RPC command responses from `events.jsonl`; retain Prime lifecycle
+  events unchanged.
+- Treat malformed/rejected handshake or prompt responses as delegate-owned
+  transport failures.
+- Do not retry through another transport after prompt inference may have
+  started.
+
+RPC does not bypass downstream CCR replacement of large user messages. Keep
+size-aware content transport for both process modes:
 
 - Measure task bytes with `Buffer.byteLength`.
 - Measure the complete initial payload including worker rules and framing.
@@ -180,6 +196,9 @@ Replace character thresholds with UTF-8 byte thresholds.
 - Tell Prime to read the manifest and exact parts; do not use wildcard guessing.
 - Add transport mode, task/effective bytes, part count, and maximum part bytes
   to the summary.
+
+Keep `--transport cli` as an explicit compatibility fallback for process
+control. Large `--no-tools` prompts fail before inference in both modes.
 
 Use a deterministic effective-payload fixture instead of depending on missing
 historical T053 artifacts.

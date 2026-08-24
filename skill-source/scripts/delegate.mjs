@@ -71,7 +71,7 @@ function parseArgs(argv) {
 	const options = { check: false, noTools: false, autonomous: false, autonomousGates: [], allowedChanges: [], fullEvents: false, requireChange: false, wslMode: false, prepareCommand: false };
 	const valueArgs = new Set([
 		"--cwd", "--prompt-file", "--out-dir", "--timeout-ms", "--provider", "--model", "--thinking",
-		"--task-id", "--work-package-id", "--task-type", "--delegation-mode",
+		"--task-id", "--work-package-id", "--task-type", "--delegation-mode", "--transport",
 		"--autonomous-max-continuations", "--autonomous-max-turns", "--autonomous-max-tokens",
 		"--startup-grace-ms", "--idle-timeout-ms", "--max-infra-restarts", "--restart-delay-ms",
 		"--no-change-timeout-ms", "--no-change-max-tool-calls", "--status-dir",
@@ -369,6 +369,8 @@ if ((options.requireChange || options.allowedChanges.length > 0) && !options.aut
 if (options.autonomous && options.autonomousGates.length === 0) {
 	fail("--autonomous requires at least one explicit --autonomous-gate");
 }
+const requestedTransport = options.transport ?? "rpc";
+if (!["rpc", "cli"].includes(requestedTransport)) fail("--transport must be rpc or cli");
 let runMetadata;
 try {
 	runMetadata = normalizeRunMetadata(options);
@@ -394,7 +396,8 @@ if (options.prepareCommand) {
 	if (options.taskId) parts.push("--task-id", options.taskId);
 	if (options.workPackageId) parts.push("--work-package-id", options.workPackageId);
 	if (options.taskType) parts.push("--task-type", options.taskType);
-	if (options.delegationMode) parts.push("--delegation-mode", options.delegationMode);
+		if (options.delegationMode) parts.push("--delegation-mode", options.delegationMode);
+		if (options.transport) parts.push("--transport", options.transport);
 	if (options.noTools) parts.push("--no-tools");
 	if (options.fullEvents) parts.push("--full-events");
 	if (options.requireChange) parts.push("--require-change");
@@ -472,13 +475,12 @@ const primeVersion = readPrimeVersion();
 
 writeFileSync(workerPromptPath, `${auditTaskContract}\n`, "utf8");
 
-let primeTask;
+let primeTask = auditTaskContract;
 let taskPartCount = 0;
 let maxTaskPartBytes = 0;
 let transportMode;
 if (effectiveTaskContractBytes <= INLINE_TASK_MAX_BYTES) {
 	transportMode = "inline";
-	primeTask = auditTaskContract;
 } else {
 	transportMode = "task-parts";
 	const taskPartsDir = join(outDir, "task-parts");
@@ -495,18 +497,24 @@ if (effectiveTaskContractBytes <= INLINE_TASK_MAX_BYTES) {
 	writeFileSync(taskManifestPath, `${JSON.stringify({ schemaVersion: 1, taskBytes, maxPartBytes: TASK_CHUNK_MAX_BYTES, parts: taskParts }, null, 2)}\n`, "utf8");
 	const wslTaskPartsDir = toWslPath(taskPartsDir);
 	primeTask = [
-		...workerRules,
-		"",
 		`TASK MANIFEST: ${wslTaskPartsDir}/manifest.json`,
 		"Read the manifest, then read each exact listed part once in order, one file per tool call.",
 		"After the last part, implement the task immediately.",
+		"",
+		...workerRules,
 	].join("\n");
 }
 const transport = {
 	mode: transportMode,
+	protocol: requestedTransport,
 	taskBytes,
 	effectiveTaskContractBytes,
 	effectiveInitialPromptBytes: Buffer.byteLength(primeTask, "utf8"),
+	wireBytes: requestedTransport === "rpc"
+		? Buffer.byteLength(`${JSON.stringify({ id: "delegate-prompt", type: "prompt", message: primeTask })}\n`, "utf8")
+		: Buffer.byteLength(primeTask, "utf8"),
+	handshakeAccepted: requestedTransport === "rpc" ? false : null,
+	promptAccepted: requestedTransport === "rpc" ? false : null,
 	inlineByteLimit: INLINE_TASK_MAX_BYTES,
 	partByteLimit: TASK_CHUNK_MAX_BYTES,
 	partCount: taskPartCount,
@@ -531,7 +539,7 @@ function buildRuntimeEnvironment() {
 const runtimeEnvironment = buildRuntimeEnvironment();
 
 function buildPrimeArgs() {
-	const primeArgs = [...PRIME_AGENT_COMMAND, "--mode", "json", "--no-session", "--cwd", wslCwd];
+	const primeArgs = [...PRIME_AGENT_COMMAND, "--mode", requestedTransport === "rpc" ? "rpc" : "json", "--no-session", "--cwd", wslCwd];
 	if (options.noTools) primeArgs.push("--no-tools");
 	if (options.provider) primeArgs.push("--provider", options.provider);
 	if (options.model) primeArgs.push("--model", options.model);
@@ -551,8 +559,10 @@ function buildPrimeArgs() {
 			primeArgs.push("--autonomous-gate", `test -z "$(git status --porcelain | cut -c4- | grep -Ev '^(${allowedPattern})$')"`);
 		}
 	}
-	const promptArgument = buildWorkerPromptArgument({ workerPrompt: primeTask });
-	primeArgs.push("--", promptArgument);
+	if (requestedTransport === "cli") {
+		const promptArgument = buildWorkerPromptArgument({ workerPrompt: primeTask });
+		primeArgs.push("--", promptArgument);
+	}
 	const environment = [...gitContext.environment, ...runtimeEnvironment];
 	return environment.length > 0 ? ["env", ...environment, ...primeArgs] : primeArgs;
 }
@@ -608,6 +618,8 @@ let healthWriteTimer = null;
 let lastChildExitCode = null;
 let lastChildSignal = null;
 let forcedTerminalReason = null;
+let rpcStateId = null;
+let rpcPromptId = null;
 
 function flushHealth() {
 	if (healthWriteTimer) {
@@ -629,26 +641,85 @@ function shouldPersistEvent(event) {
 	return options.fullEvents || !["message_update", "tool_execution_update"].includes(event?.type);
 }
 
+function processPrimeEvent(event, line = JSON.stringify(event)) {
+	eventCount++;
+	attemptEventCount++;
+	recordProtocolEvent(attemptProtocol, event);
+	if (event.type === "message_end") finalText = assistantText(event.message) || finalText;
+	if (event.type === "agent_end" && Array.isArray(event.messages)) {
+		for (const message of event.messages) finalText = assistantText(message) || finalText;
+	}
+	if (shouldPersistEvent(event)) {
+		events.write(`${line}\n`);
+		persistedEventCount++;
+	} else {
+		droppedStreamingEventCount++;
+	}
+	onValidEvent(event);
+}
+
+function failRpcTransport(reason, detail) {
+	forcedTerminalReason = reason;
+	lastClassification = {
+		kind: "failed",
+		reason,
+		terminalStatus: STATUS.FAILED,
+		failureClass: "transport",
+		failureOwner: "delegate_skill",
+	};
+	if (detail) errors.write(`${detail}\n`);
+	terminateChild(reason);
+}
+
+function writeRpcPrompt() {
+	const command = `${JSON.stringify({ id: rpcPromptId, type: "prompt", message: primeTask })}\n`;
+	child.stdin.end(command, "utf8");
+}
+
+function processRpcResponse(response) {
+	if (response.id === rpcStateId) {
+		const sessionId = response.success && response.data?.sessionId;
+		if (!sessionId) {
+			failRpcTransport("rpc_handshake_failed", response.error ?? "RPC get_state did not return sessionId");
+			return;
+		}
+		transport.handshakeAccepted = true;
+		processPrimeEvent({
+			type: "session",
+			version: 3,
+			id: sessionId,
+			timestamp: new Date().toISOString(),
+			cwd: wslCwd,
+			synthetic: true,
+			source: "delegate_rpc",
+		});
+		writeRpcPrompt();
+		return;
+	}
+	if (response.id === rpcPromptId) {
+		if (!response.success) {
+			failRpcTransport("rpc_prompt_rejected", response.error ?? "RPC prompt was rejected");
+			return;
+		}
+		transport.promptAccepted = true;
+	}
+}
+
 function processEventLine(rawLine) {
 	const line = rawLine.trim();
 	if (!line) return;
 	try {
 		const event = JSON.parse(line);
-		eventCount++;
-		attemptEventCount++;
-		recordProtocolEvent(attemptProtocol, event);
-		if (event.type === "message_end") finalText = assistantText(event.message) || finalText;
-		if (event.type === "agent_end" && Array.isArray(event.messages)) {
-			for (const message of event.messages) finalText = assistantText(message) || finalText;
+		if (requestedTransport === "rpc" && event.type === "response") {
+			processRpcResponse(event);
+			return;
 		}
-		if (shouldPersistEvent(event)) {
-			events.write(`${line}\n`);
-			persistedEventCount++;
-		} else {
-			droppedStreamingEventCount++;
-		}
-		onValidEvent(event);
+		processPrimeEvent(event, line);
 	} catch {
+		if (requestedTransport === "rpc" && !transport.handshakeAccepted) {
+			failRpcTransport("rpc_handshake_malformed", `Malformed RPC response: ${line.slice(0, 500)}`);
+			return;
+		}
 		parseErrors++;
 		recordProtocolParseError(attemptProtocol);
 		events.write(`${JSON.stringify({ type: "parse_error", preview: line.slice(0, 500) })}\n`);
@@ -786,13 +857,24 @@ function spawnAttempt() {
 	timedOut = false;
 	spawnFailed = false;
 	forcedTerminalReason = null;
+	rpcStateId = `delegate-state-${attempt}`;
+	rpcPromptId = `delegate-prompt-${attempt}`;
+	transport.handshakeAccepted = requestedTransport === "rpc" ? false : null;
+	transport.promptAccepted = requestedTransport === "rpc" ? false : null;
 	stdoutBuffer = "";
 	const attemptStartedAt = new Date().toISOString();
 	attempts.push({ attempt, startedAt: attemptStartedAt });
 
-	const primeCmd = shellJoin(buildPrimeArgs());
-	const fullCmd = `cd ${shellQuote(wslCwd)} && ${primeCmd}`;
-	child = WSL_MODE ? spawn("bash", ["-lc", fullCmd], { stdio: ["ignore", "pipe", "pipe"] }) : spawn("wsl.exe", ["bash", "-lc", fullCmd], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+	const primeArgs = buildPrimeArgs();
+	if (requestedTransport === "rpc") {
+		child = WSL_MODE
+			? spawn(primeArgs[0], primeArgs.slice(1), { cwd: wslCwd, stdio: ["pipe", "pipe", "pipe"] })
+			: spawn("wsl.exe", ["--cd", wslCwd, "--", ...primeArgs], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+	} else {
+		const primeCmd = shellJoin(primeArgs);
+		const fullCmd = `cd ${shellQuote(wslCwd)} && ${primeCmd}`;
+		child = WSL_MODE ? spawn("bash", ["-lc", fullCmd], { stdio: ["ignore", "pipe", "pipe"] }) : spawn("wsl.exe", ["bash", "-lc", fullCmd], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+	}
 
 	health = recordAttemptStart(health, { attempt, childPid: child.pid, now: Date.now() });
 	health.attemptStartedAt = attemptStartedAt;
@@ -825,6 +907,12 @@ function spawnAttempt() {
 	child.on("close", (code, signal) => {
 		if (!attemptClosed) onChildClose(code, signal);
 	});
+	if (requestedTransport === "rpc") {
+		child.stdin.on("error", (error) => {
+			if (!attemptClosed && !forcedTerminalReason) failRpcTransport("rpc_stdin_failed", error.message);
+		});
+		child.stdin.write(`${JSON.stringify({ id: rpcStateId, type: "get_state" })}\n`, "utf8");
+	}
 
 	startupTimer = setTimeout(onStartupTimeout, startupGraceMs);
 	if (options.requireChange) noChangeTimer = setTimeout(onNoChangeTimeout, noChangeTimeoutMs);
@@ -890,6 +978,15 @@ function onChildClose(code, signal) {
 
 	appendSyntheticEvent({ kind: "attempt_end", outcome: classification.kind, reason: classification.reason, exitCode: code });
 	if (forcedTerminalReason) {
+		if (forcedTerminalReason.startsWith("rpc_")) {
+			lastClassification = {
+				kind: "failed",
+				reason: forcedTerminalReason,
+				terminalStatus: STATUS.FAILED,
+				failureClass: "transport",
+				failureOwner: "delegate_skill",
+			};
+		}
 		finalize(STATUS.FAILED, forcedTerminalReason, forcedTerminalReason);
 		return;
 	}

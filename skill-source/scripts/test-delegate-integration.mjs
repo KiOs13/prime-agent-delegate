@@ -60,10 +60,24 @@ function sha256(path) {
 	return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-test("normal lifecycle preserves semantic terminal events and seals artifacts", () => {
+function effectivePrompt(prompt) {
+	return [
+		"You are a delegated coding worker. Work only in cwd.",
+		"Do not commit, push, deploy, alter credentials, or perform destructive cleanup.",
+		"Use targeted reads. Do not open worker-prompt.md; it is only an audit artifact.",
+		"Do not edit unless the task explicitly requests it.",
+		"Return one concise final report.",
+		"",
+		"TASK:",
+		prompt,
+	].join("\n");
+}
+
+test("default RPC uses task-parts for large prompts and seals artifacts", () => {
 	const cwd = createRepo();
 	const outDir = join(cwd, ".prime-delegate", "runs", "normal");
-	const result = runDelegate({ cwd, outDir, prompt: "Проверка 世界 😀 mixed UTF-8 ".repeat(40) });
+	const prompt = "Проверка 世界 😀 \u2028\u2029 mixed UTF-8 ".repeat(4000).trim();
+	const result = runDelegate({ cwd, outDir, prompt });
 	assert.equal(result.status, 0, result.stderr);
 
 	const summary = json(join(outDir, "summary.json"));
@@ -73,23 +87,19 @@ test("normal lifecycle preserves semantic terminal events and seals artifacts", 
 	assert.equal(summary.delegationMode, "investigate");
 	assert.equal(summary.taskType, "investigation");
 	assert.equal(summary.droppedStreamingEventCount, 2);
+	assert.equal(summary.transport.protocol, "rpc");
+	assert.equal(summary.transport.mode, "task-parts");
+	assert.equal(summary.transport.handshakeAccepted, true);
+	assert.equal(summary.transport.promptAccepted, true);
+	const taskManifest = json(join(outDir, "task-parts", "manifest.json"));
+	assert.equal(taskManifest.parts.map((part) => readFileSync(join(outDir, "task-parts", part.name), "utf8")).join(""), prompt);
+	for (const part of taskManifest.parts) assert.equal(sha256(join(outDir, "task-parts", part.name)), part.sha256);
 
 	const events = readFileSync(join(outDir, "events.jsonl"), "utf8");
 	assert.equal(events.includes("message_update"), false);
 	assert.equal(events.includes("tool_execution_update"), false);
 	assert.match(events, /complete message/);
 	assert.match(events, /complete tool result/);
-
-	const taskManifest = json(join(outDir, "task-parts", "manifest.json"));
-	assert.ok(taskManifest.parts.length > 1);
-	assert.equal(
-		taskManifest.parts.map((part) => readFileSync(join(outDir, "task-parts", part.name), "utf8")).join(""),
-		"Проверка 世界 😀 mixed UTF-8 ".repeat(40).trim(),
-	);
-	for (const part of taskManifest.parts) {
-		assert.ok(part.bytes <= taskManifest.maxPartBytes);
-		assert.equal(sha256(join(outDir, "task-parts", part.name)), part.sha256);
-	}
 
 	const manifest = json(join(outDir, "run-manifest.json"));
 	assert.equal(manifest.runId, summary.runId);
@@ -106,9 +116,27 @@ test("normal lifecycle preserves semantic terminal events and seals artifacts", 
 	}
 });
 
-test("no-tools keeps readable tasks inline and rejects oversized payloads before artifacts", () => {
+test("RPC inline preserves exact Unicode prompt bytes", () => {
 	const cwd = createRepo();
-	const inlineOut = join(cwd, ".prime-delegate", "runs", "no-tools-inline");
+	const outDir = join(cwd, ".prime-delegate", "runs", "rpc-inline");
+	const prompt = "Проверка 世界 😀 \u2028\u2029";
+	const expectedPromptSha = createHash("sha256").update(effectivePrompt(prompt.trim())).digest("hex");
+	const result = runDelegate({
+		cwd,
+		outDir,
+		prompt,
+		env: { PRIME_AGENT_DELEGATE_FAKE_EXPECT_PROMPT_SHA256: expectedPromptSha },
+	});
+	assert.equal(result.status, 0, result.stderr);
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.transport.protocol, "rpc");
+	assert.equal(summary.transport.mode, "inline");
+	assert.equal(existsSync(join(outDir, "task-parts")), false);
+});
+
+test("no-tools remains inline-only across transports", () => {
+	const cwd = createRepo();
+	const inlineOut = join(cwd, ".prime-delegate", "runs", "no-tools-rpc");
 	const inline = runDelegate({
 		cwd,
 		outDir: inlineOut,
@@ -116,6 +144,7 @@ test("no-tools keeps readable tasks inline and rejects oversized payloads before
 		args: ["--no-tools"],
 	});
 	assert.equal(inline.status, 0, inline.stderr);
+	assert.equal(json(join(inlineOut, "summary.json")).transport.protocol, "rpc");
 	assert.equal(json(join(inlineOut, "summary.json")).transport.mode, "inline");
 	assert.equal(existsSync(join(inlineOut, "task-parts")), false);
 
@@ -128,6 +157,36 @@ test("no-tools keeps readable tasks inline and rejects oversized payloads before
 	});
 	assert.equal(oversized.status, 2);
 	assert.equal(existsSync(oversizedOut), false);
+});
+
+test("explicit CLI transport retains task-parts", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "cli-parts");
+	const prompt = "Проверка 世界 😀 mixed UTF-8 ".repeat(40).trim();
+	const result = runDelegate({ cwd, outDir, prompt, args: ["--transport", "cli"] });
+	assert.equal(result.status, 0, result.stderr);
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.transport.mode, "task-parts");
+	assert.equal(summary.transport.protocol, "cli");
+	const taskManifest = json(join(outDir, "task-parts", "manifest.json"));
+	assert.equal(taskManifest.parts.map((part) => readFileSync(join(outDir, "task-parts", part.name), "utf8")).join(""), prompt);
+	for (const part of taskManifest.parts) assert.equal(sha256(join(outDir, "task-parts", part.name)), part.sha256);
+});
+
+test("RPC handshake and prompt rejection are delegate transport failures", () => {
+	for (const [scenario, reason] of [
+		["rpc-reject-handshake", "rpc_handshake_failed"],
+		["rpc-malformed-handshake", "rpc_handshake_malformed"],
+		["rpc-reject-prompt", "rpc_prompt_rejected"],
+	]) {
+		const cwd = createRepo();
+		const outDir = join(cwd, ".prime-delegate", "runs", scenario);
+		const result = runDelegate({ cwd, outDir, prompt: scenario, scenario });
+		assert.equal(result.status, 1, scenario);
+		const summary = json(join(outDir, "summary.json"));
+		assert.equal(summary.terminalReason, reason, scenario);
+		assert.equal(summary.failureOwner, "delegate_skill", scenario);
+	}
 });
 
 test("investigate fails when Prime changes the worktree", () => {

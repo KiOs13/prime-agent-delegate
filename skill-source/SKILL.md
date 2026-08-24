@@ -72,9 +72,16 @@ Implementation uses:
 Repeat `--allow-change` for each permitted file. Prototype mode uses
 `--delegation-mode prototype`; use autonomous gates whenever it may edit.
 
-`--no-tools` supports only tasks whose complete effective prompt fits the
-1024-byte inline limit. Larger tasks fail before inference because Prime could
-not read split task files without tools.
+Prime process control uses RPC stdin by default, so the initial instruction
+never enters argv or a shell command. The launcher performs a `get_state`
+handshake, records a synthetic session header with Prime's real session id,
+sends one prompt command, and closes stdin. Use `--transport cli` only as a
+compatibility fallback.
+
+Content transport remains size-aware because Prime's downstream CCR can replace
+large user messages even when RPC delivery is byte-perfect. Small effective
+prompts are inline; large tasks use `task-parts/manifest.json`. `--no-tools`
+therefore remains limited to effective prompts of at most 1024 UTF-8 bytes.
 
 Optional metadata:
 
@@ -83,6 +90,7 @@ Optional metadata:
 --work-package-id <id>
 --task-type implementation|investigation|testing|prototype
 --delegation-mode implement|prototype|investigate
+--transport rpc|cli
 ```
 
 ## Run storage
@@ -103,7 +111,7 @@ Each run retains:
 - `events.jsonl`, `stderr.log`, and `worker-prompt.md`;
 - `health.json`, `summary.json`, and `audit-summary.json`;
 - `run-manifest.json`;
-- split `task-parts/` when required;
+- split `task-parts/` for large content regardless of RPC or CLI process mode;
 - `codex-outcome.json` after Codex review.
 
 Semantic-compact capture preserves complete terminal messages, tool results,
