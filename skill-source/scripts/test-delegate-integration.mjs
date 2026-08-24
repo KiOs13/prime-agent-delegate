@@ -173,6 +173,22 @@ test("explicit CLI transport retains task-parts", () => {
 	for (const part of taskManifest.parts) assert.equal(sha256(join(outDir, "task-parts", part.name)), part.sha256);
 });
 
+test("--transport invalid exits with code 2 before creating out-dir", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "bad-transport");
+	const result = runDelegate({ cwd, outDir, prompt: "invalid transport", args: ["--transport", "invalid"] });
+	assert.equal(result.status, 2);
+	assert.equal(existsSync(outDir), false);
+});
+
+test("--prepare-command --transport cli includes the exact quoted transport args", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "prepare-cli");
+	const result = runDelegate({ cwd, outDir, prompt: "prepare cli", args: ["--prepare-command", "--transport", "cli"] });
+	assert.equal(result.status, 0, result.stderr);
+	assert.match(result.stdout, /'--transport' 'cli'/);
+});
+
 test("RPC handshake and prompt rejection are delegate transport failures", () => {
 	for (const [scenario, reason] of [
 		["rpc-reject-handshake", "rpc_handshake_failed"],
