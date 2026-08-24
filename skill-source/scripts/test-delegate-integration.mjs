@@ -60,19 +60,6 @@ function sha256(path) {
 	return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-function effectivePrompt(prompt) {
-	return [
-		"You are a delegated coding worker. Work only in cwd.",
-		"Do not commit, push, deploy, alter credentials, or perform destructive cleanup.",
-		"Use targeted reads. Do not open worker-prompt.md; it is only an audit artifact.",
-		"Do not edit unless the task explicitly requests it.",
-		"Return one concise final report.",
-		"",
-		"TASK:",
-		prompt,
-	].join("\n");
-}
-
 test("default RPC uses task-parts for large prompts and seals artifacts", () => {
 	const cwd = createRepo();
 	const outDir = join(cwd, ".prime-delegate", "runs", "normal");
@@ -116,22 +103,17 @@ test("default RPC uses task-parts for large prompts and seals artifacts", () => 
 	}
 });
 
-test("RPC inline preserves exact Unicode prompt bytes", () => {
+test("short tools-enabled RPC uses task-parts and preserves exact Unicode", () => {
 	const cwd = createRepo();
-	const outDir = join(cwd, ".prime-delegate", "runs", "rpc-inline");
+	const outDir = join(cwd, ".prime-delegate", "runs", "rpc-parts");
 	const prompt = "Проверка 世界 😀 \u2028\u2029";
-	const expectedPromptSha = createHash("sha256").update(effectivePrompt(prompt.trim())).digest("hex");
-	const result = runDelegate({
-		cwd,
-		outDir,
-		prompt,
-		env: { PRIME_AGENT_DELEGATE_FAKE_EXPECT_PROMPT_SHA256: expectedPromptSha },
-	});
+	const result = runDelegate({ cwd, outDir, prompt });
 	assert.equal(result.status, 0, result.stderr);
 	const summary = json(join(outDir, "summary.json"));
 	assert.equal(summary.transport.protocol, "rpc");
-	assert.equal(summary.transport.mode, "inline");
-	assert.equal(existsSync(join(outDir, "task-parts")), false);
+	assert.equal(summary.transport.mode, "task-parts");
+	const taskManifest = json(join(outDir, "task-parts", "manifest.json"));
+	assert.equal(taskManifest.parts.map((part) => readFileSync(join(outDir, "task-parts", part.name), "utf8")).join(""), prompt.trim());
 });
 
 test("no-tools remains inline-only across transports", () => {
@@ -162,7 +144,7 @@ test("no-tools remains inline-only across transports", () => {
 test("explicit CLI transport retains task-parts", () => {
 	const cwd = createRepo();
 	const outDir = join(cwd, ".prime-delegate", "runs", "cli-parts");
-	const prompt = "Проверка 世界 😀 mixed UTF-8 ".repeat(40).trim();
+	const prompt = "short CLI task";
 	const result = runDelegate({ cwd, outDir, prompt, args: ["--transport", "cli"] });
 	assert.equal(result.status, 0, result.stderr);
 	const summary = json(join(outDir, "summary.json"));
@@ -171,6 +153,44 @@ test("explicit CLI transport retains task-parts", () => {
 	const taskManifest = json(join(outDir, "task-parts", "manifest.json"));
 	assert.equal(taskManifest.parts.map((part) => readFileSync(join(outDir, "task-parts", part.name), "utf8")).join(""), prompt);
 	for (const part of taskManifest.parts) assert.equal(sha256(join(outDir, "task-parts", part.name)), part.sha256);
+});
+
+test("--require-change fails closed when Prime exits zero without an edit", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "required-change-missing");
+	const result = runDelegate({
+		cwd,
+		outDir,
+		scenario: "no-change",
+		prompt: "make a required change",
+		args: [
+			"--autonomous",
+			"--require-change",
+			"--allow-change", "fake-prime-output.txt",
+			"--autonomous-gate", "true",
+			"--delegation-mode", "implement",
+		],
+	});
+	assert.equal(result.status, 1, result.stderr);
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.terminalReason, "required_change_missing");
+	assert.equal(summary.failureClass, "contract");
+	assert.equal(summary.failureOwner, "prime_agent");
+	assert.equal(summary.restartCount, 0);
+	assert.equal(existsSync(join(cwd, "fake-prime-output.txt")), false);
+});
+
+test("--repeated-tool-failure-limit rejects zero before creating out-dir", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "bad-repeated-limit");
+	const result = runDelegate({
+		cwd,
+		outDir,
+		prompt: "invalid repeated failure limit",
+		args: ["--repeated-tool-failure-limit", "0"],
+	});
+	assert.equal(result.status, 2);
+	assert.equal(existsSync(outDir), false);
 });
 
 test("--transport invalid exits with code 2 before creating out-dir", () => {

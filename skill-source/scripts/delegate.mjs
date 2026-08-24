@@ -487,7 +487,7 @@ let primeTask = auditTaskContract;
 let taskPartCount = 0;
 let maxTaskPartBytes = 0;
 let transportMode;
-if (effectiveTaskContractBytes <= INLINE_TASK_MAX_BYTES) {
+if (options.noTools) {
 	transportMode = "inline";
 } else {
 	transportMode = "task-parts";
@@ -1048,6 +1048,37 @@ function onChildClose(code, signal) {
 			finalize(STATUS.FAILED, "read_only_violation", "investigate_worktree_changed", porcelainResult.value);
 			return;
 		}
+	}
+
+	if (classification.kind === "completed" && options.requireChange) {
+		const porcelainResult = currentGitPorcelain();
+		if (!porcelainResult.ok) {
+			lastClassification = {
+				kind: "failed",
+				reason: porcelainResult.error,
+				terminalStatus: STATUS.FAILED,
+				failureClass: "git",
+				failureOwner: "delegate_skill",
+			};
+			finalize(STATUS.FAILED, porcelainResult.error, "git_status_failed");
+			return;
+		}
+		if (porcelainResult.value === gitContext.baseline) {
+			lastClassification = {
+				kind: "failed",
+				reason: "required_change_missing",
+				terminalStatus: STATUS.FAILED,
+				failureClass: "contract",
+				failureOwner: "prime_agent",
+			};
+			attempts[attempts.length - 1].kind = "failed";
+			attempts[attempts.length - 1].reason = "required_change_missing";
+			appendSyntheticEvent({ kind: "required_change_missing" });
+			finalize(STATUS.FAILED, "required_change_missing", "required_change_missing");
+			return;
+		}
+		finalize(STATUS.COMPLETED, classification.reason, "completed_not_restartable", porcelainResult.value);
+		return;
 	}
 
 	if (classification.kind === "completed" || classification.kind === "timed_out" || classification.kind === "failed" || classification.kind === "config_error") {

@@ -78,10 +78,11 @@ handshake, records a synthetic session header with Prime's real session id,
 sends one prompt command, and closes stdin. Use `--transport cli` only as a
 compatibility fallback.
 
-Content transport remains size-aware because Prime's downstream CCR can replace
-large user messages even when RPC delivery is byte-perfect. Small effective
-prompts are inline; large tasks use `task-parts/manifest.json`. `--no-tools`
-therefore remains limited to effective prompts of at most 1024 UTF-8 bytes.
+Prime's downstream CCR can replace user messages even when RPC delivery is
+byte-perfect. Tools-enabled runs therefore always store the task in
+`task-parts/manifest.json`; RPC or CLI carries only the short manifest
+instruction. `--no-tools` cannot read files, so it remains inline-only and
+limited to effective prompts of at most 1024 UTF-8 bytes.
 
 Optional metadata:
 
@@ -152,6 +153,8 @@ configuration, and changed-worktree failures do not retry.
 After the first detected worktree change, the launcher also stops eight
 consecutive identical failed tool completions as `repeated_tool_failure`
 (`tool_loop`, owned by `prime_agent`) while preserving the partial worktree.
+`--require-change` is also checked by the launcher at process completion; exit
+0 without a worktree change fails as `required_change_missing`.
 
 Check an existing run without starting Prime:
 

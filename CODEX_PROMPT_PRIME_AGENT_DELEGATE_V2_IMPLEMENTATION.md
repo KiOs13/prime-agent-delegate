@@ -185,11 +185,12 @@ Use RPC stdin as the default process-control transport.
   started.
 
 RPC does not bypass downstream CCR replacement of large user messages. Keep
-size-aware content transport for both process modes:
+file-backed content transport for both process modes:
 
 - Measure task bytes with `Buffer.byteLength`.
 - Measure the complete initial payload including worker rules and framing.
-- Select inline or split transport from effective bytes.
+- Use split task-parts for every tools-enabled run.
+- Keep inline transport only for `--no-tools`, with its existing effective-byte limit.
 - Split by Unicode code points without exceeding the part byte limit.
 - Create `task-parts/manifest.json` with ordered exact file names, byte sizes,
   and SHA-256 hashes.

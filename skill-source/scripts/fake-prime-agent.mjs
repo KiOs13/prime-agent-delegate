@@ -18,6 +18,7 @@ const scenario = process.env.PRIME_AGENT_DELEGATE_FAKE_SCENARIO ?? "normal";
 const cwdIndex = args.indexOf("--cwd");
 const cwd = cwdIndex >= 0 ? args[cwdIndex + 1] : null;
 function makeChange() {
+	if (scenario === "no-change") return;
 	if (!(args.includes("--autonomous") || process.env.PRIME_AGENT_DELEGATE_FAKE_FORCE_CHANGE === "1") || !cwd || !existsSync(cwd)) return;
 	writeFileSync(
 		join(cwd, process.env.PRIME_AGENT_DELEGATE_FAKE_CHANGE ?? "fake-prime-output.txt"),
