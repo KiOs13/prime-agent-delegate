@@ -114,6 +114,8 @@ test("short tools-enabled RPC uses task-parts and preserves exact Unicode", () =
 	assert.equal(summary.transport.mode, "task-parts");
 	const taskManifest = json(join(outDir, "task-parts", "manifest.json"));
 	assert.equal(taskManifest.parts.map((part) => readFileSync(join(outDir, "task-parts", part.name), "utf8")).join(""), prompt.trim());
+	assert.equal(taskManifest.taskBytes, Buffer.byteLength(prompt.trim(), "utf8"));
+	assert.ok(taskManifest.parts.length >= 1);
 });
 
 test("no-tools remains inline-only across transports", () => {
