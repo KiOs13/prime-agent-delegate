@@ -70,6 +70,21 @@ function emitScenario({ includeSession = true } = {}) {
 		emit({ type: "tool_execution_end", toolCallId: "missing" });
 		return;
 	}
+	if (scenario === "repeated-tool-failure") {
+		for (const event of lifecycle.slice(0, includeSession ? 3 : 2)) emit(event);
+		for (let index = 1; index <= 12; index++) {
+			const toolCallId = `failed-tool-${index}`;
+			emit({ type: "tool_execution_start", toolCallId, toolName: "ipython" });
+			emit({
+				type: "tool_execution_end",
+				toolCallId,
+				toolName: "ipython",
+				result: { content: [{ type: "text", text: "Kernel has been shut down" }], details: { durationMs: index } },
+				isError: true,
+			});
+		}
+		return;
+	}
 	for (const event of lifecycle) emit(event);
 }
 

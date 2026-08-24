@@ -28,6 +28,7 @@ import {
 	recordProtocolEvent,
 	recordProtocolParseError,
 	recordRestarting,
+	recordRepeatedToolFailure,
 	recordTerminal,
 	recordValidEvent,
 	shouldStopForNoChange,
@@ -52,6 +53,7 @@ const DEFAULT_MAX_INFRA_RESTARTS = 1;
 const DEFAULT_RESTART_DELAY_MS = 5000;
 const DEFAULT_NO_CHANGE_TIMEOUT_MS = 600000;
 const DEFAULT_NO_CHANGE_MAX_TOOL_CALLS = 80;
+const DEFAULT_REPEATED_TOOL_FAILURE_LIMIT = 8;
 const DEFAULT_AUTONOMOUS_MAX_CONTINUATIONS = 3;
 const DEFAULT_AUTONOMOUS_MAX_TURNS = 12;
 const DEFAULT_AUTONOMOUS_MAX_TOKENS = 1000000;
@@ -74,7 +76,7 @@ function parseArgs(argv) {
 		"--task-id", "--work-package-id", "--task-type", "--delegation-mode", "--transport",
 		"--autonomous-max-continuations", "--autonomous-max-turns", "--autonomous-max-tokens",
 		"--startup-grace-ms", "--idle-timeout-ms", "--max-infra-restarts", "--restart-delay-ms",
-		"--no-change-timeout-ms", "--no-change-max-tool-calls", "--status-dir",
+		"--no-change-timeout-ms", "--no-change-max-tool-calls", "--repeated-tool-failure-limit", "--status-dir",
 	]);
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
@@ -390,6 +392,7 @@ if (options.prepareCommand) {
 	if (options.restartDelayMs) parts.push("--restart-delay-ms", options.restartDelayMs);
 	if (options.noChangeTimeoutMs) parts.push("--no-change-timeout-ms", options.noChangeTimeoutMs);
 	if (options.noChangeMaxToolCalls) parts.push("--no-change-max-tool-calls", options.noChangeMaxToolCalls);
+	if (options.repeatedToolFailureLimit) parts.push("--repeated-tool-failure-limit", options.repeatedToolFailureLimit);
 	if (options.provider) parts.push("--provider", options.provider);
 	if (options.model) parts.push("--model", options.model);
 	if (options.thinking) parts.push("--thinking", options.thinking);
@@ -426,6 +429,11 @@ const noChangeTimeoutMs = parseIntOption(
 const noChangeMaxToolCalls = parseIntOption(
 	options.noChangeMaxToolCalls ?? DEFAULT_NO_CHANGE_MAX_TOOL_CALLS,
 	"--no-change-max-tool-calls",
+	{ min: 1 },
+);
+const repeatedToolFailureLimit = parseIntOption(
+	options.repeatedToolFailureLimit ?? DEFAULT_REPEATED_TOOL_FAILURE_LIMIT,
+	"--repeated-tool-failure-limit",
 	{ min: 1 },
 );
 const autonomousMaxContinuations = parseIntOption(options.autonomousMaxContinuations ?? DEFAULT_AUTONOMOUS_MAX_CONTINUATIONS, "--autonomous-max-continuations", { min: 1 });
@@ -575,6 +583,7 @@ let health = createHealth({
 	idleTimeoutMs,
 	noChangeTimeoutMs,
 	noChangeMaxToolCalls,
+	repeatedToolFailureLimit,
 	restartDelayMs,
 	overallTimeoutMs: timeoutMs,
 	maxInfraRestarts,
@@ -620,6 +629,7 @@ let lastChildSignal = null;
 let forcedTerminalReason = null;
 let rpcStateId = null;
 let rpcPromptId = null;
+let repeatedToolFailure = { fingerprint: null, count: 0, toolName: null };
 
 function flushHealth() {
 	if (healthWriteTimer) {
@@ -729,6 +739,7 @@ function processEventLine(rawLine) {
 
 function onValidEvent(event) {
 	if (forcedTerminalReason) return;
+	if (pendingCondition === FAILURE_KIND.REPEATED_TOOL_FAILURE) return;
 	const wasFirstEvent = !firstEventSeen;
 	firstEventSeen = true;
 	const now = Date.now();
@@ -754,6 +765,24 @@ function onValidEvent(event) {
 		})) {
 			pendingCondition = FAILURE_KIND.NO_CHANGE_PROGRESS;
 			terminateChild(FAILURE_KIND.NO_CHANGE_PROGRESS);
+			return;
+		}
+	}
+	if (event?.type === "tool_execution_end") {
+		repeatedToolFailure = recordRepeatedToolFailure(repeatedToolFailure, event);
+		health = updateHealth(health, {
+			repeatedToolFailureCount: repeatedToolFailure.count,
+			repeatedToolFailureTool: repeatedToolFailure.toolName,
+			now,
+		});
+		if (health.changeDetectedAt && repeatedToolFailure.count >= repeatedToolFailureLimit) {
+			pendingCondition = FAILURE_KIND.REPEATED_TOOL_FAILURE;
+			appendSyntheticEvent({
+				kind: FAILURE_KIND.REPEATED_TOOL_FAILURE,
+				count: repeatedToolFailure.count,
+				toolName: repeatedToolFailure.toolName,
+			});
+			terminateChild(FAILURE_KIND.REPEATED_TOOL_FAILURE);
 			return;
 		}
 	}
@@ -859,6 +888,7 @@ function spawnAttempt() {
 	forcedTerminalReason = null;
 	rpcStateId = `delegate-state-${attempt}`;
 	rpcPromptId = `delegate-prompt-${attempt}`;
+	repeatedToolFailure = { fingerprint: null, count: 0, toolName: null };
 	transport.handshakeAccepted = requestedTransport === "rpc" ? false : null;
 	transport.promptAccepted = requestedTransport === "rpc" ? false : null;
 	stdoutBuffer = "";
@@ -1021,7 +1051,13 @@ function onChildClose(code, signal) {
 	}
 
 	if (classification.kind === "completed" || classification.kind === "timed_out" || classification.kind === "failed" || classification.kind === "config_error") {
-		finalize(classification.terminalStatus, classification.reason, `${classification.kind}_not_restartable`);
+		const porcelain = classification.reason === FAILURE_KIND.REPEATED_TOOL_FAILURE ? currentGitPorcelain() : null;
+		finalize(
+			classification.terminalStatus,
+			classification.reason,
+			`${classification.kind}_not_restartable`,
+			porcelain?.ok ? porcelain.value : undefined,
+		);
 		return;
 	}
 
@@ -1111,6 +1147,9 @@ function finalize(status, reason, decisionReason, worktreeDiff) {
 		idleTimeoutMs,
 		noChangeTimeoutMs,
 		noChangeMaxToolCalls,
+		repeatedToolFailureLimit,
+		repeatedToolFailureCount: health.repeatedToolFailureCount,
+		repeatedToolFailureTool: health.repeatedToolFailureTool,
 		maxInfraRestarts,
 		restartDelayMs,
 		autonomous: options.autonomous,

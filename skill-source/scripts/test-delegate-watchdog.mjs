@@ -38,6 +38,7 @@ import {
 	recordProtocolEvent,
 	recordProtocolParseError,
 	recordRestarting,
+	recordRepeatedToolFailure,
 	recordTerminal,
 	recordValidEvent,
 	shouldStopForNoChange,
@@ -133,6 +134,46 @@ test("no-change watchdog stops only required unchanged work", () => {
 	assert.equal(shouldStopForNoChange({ requireChange: true, elapsedMs: 599999, timeoutMs: 600000, toolCallCount: 79, maxToolCalls: 80 }), false);
 	assert.equal(shouldStopForNoChange({ requireChange: true, elapsedMs: 600000, timeoutMs: 600000, toolCallCount: 0, maxToolCalls: 80 }), true);
 	assert.equal(shouldStopForNoChange({ requireChange: true, elapsedMs: 0, timeoutMs: 600000, toolCallCount: 80, maxToolCalls: 80 }), true);
+});
+
+test("repeated tool failure tracker ignores volatile fields and resets", () => {
+	let state = recordRepeatedToolFailure({}, {
+		type: "tool_execution_end",
+		toolCallId: "one",
+		toolName: "ipython",
+		result: { content: [{ type: "text", text: "Kernel has  been shut down" }], details: { durationMs: 10 } },
+		isError: true,
+	});
+	assert.equal(state.count, 1);
+	state = recordRepeatedToolFailure(state, {
+		type: "tool_execution_end",
+		toolCallId: "two",
+		toolName: "ipython",
+		result: { content: [{ type: "text", text: "Kernel has been shut down" }], details: { durationMs: 999 } },
+		isError: true,
+	});
+	assert.equal(state.count, 2);
+	state = recordRepeatedToolFailure(state, {
+		type: "tool_execution_end",
+		toolName: "ipython",
+		result: { content: "Different failure" },
+		isError: true,
+	});
+	assert.equal(state.count, 1);
+	assert.deepEqual(recordRepeatedToolFailure(state, {
+		type: "tool_execution_end",
+		toolName: "ipython",
+		result: { content: "ok" },
+	}), { fingerprint: null, count: 0, toolName: null });
+});
+
+test("repeated tool failures are terminal Prime loops", () => {
+	const cls = classifyChildExit({ watchdogCondition: FAILURE_KIND.REPEATED_TOOL_FAILURE });
+	assert.equal(cls.kind, "failed");
+	assert.equal(cls.reason, FAILURE_KIND.REPEATED_TOOL_FAILURE);
+	assert.equal(cls.failureClass, "tool_loop");
+	assert.equal(cls.failureOwner, "prime_agent");
+	assert.equal(decideRestart(restartArgs({ kind: cls.kind })).restart, false);
 });
 
 test("worker receives the task contract inline without an @file lookup", () => {

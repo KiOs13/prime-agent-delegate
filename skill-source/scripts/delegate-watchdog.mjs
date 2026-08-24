@@ -33,6 +33,7 @@ export const FAILURE_KIND = Object.freeze({
 	IDLE_TIMEOUT: "idle_timeout",
 	EXIT_BEFORE_FIRST_EVENT: "exit_before_first_event",
 	NO_CHANGE_PROGRESS: "no_change_progress",
+	REPEATED_TOOL_FAILURE: "repeated_tool_failure",
 });
 
 const ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
@@ -233,6 +234,9 @@ export function createHealth(options = {}) {
 		idleTimeoutMs: options.idleTimeoutMs ?? 300000,
 		noChangeTimeoutMs: options.noChangeTimeoutMs ?? 600000,
 		noChangeMaxToolCalls: options.noChangeMaxToolCalls ?? 80,
+		repeatedToolFailureLimit: options.repeatedToolFailureLimit ?? 8,
+		repeatedToolFailureCount: options.repeatedToolFailureCount ?? 0,
+		repeatedToolFailureTool: options.repeatedToolFailureTool ?? null,
 		restartDelayMs: options.restartDelayMs ?? 5000,
 		overallTimeoutMs: options.overallTimeoutMs ?? 30 * 60 * 1000,
 	};
@@ -264,6 +268,8 @@ export function recordAttemptStart(health, { attempt, childPid, now = Date.now()
 		attemptEventCount: 0,
 		attemptToolCallCount: 0,
 		changeDetectedAt: null,
+		repeatedToolFailureCount: 0,
+		repeatedToolFailureTool: null,
 		lastReason: "attempt_started",
 		now,
 	});
@@ -336,6 +342,9 @@ export function classifyChildExit({
 	if (watchdogCondition === FAILURE_KIND.NO_CHANGE_PROGRESS) {
 		return result("failed", FAILURE_KIND.NO_CHANGE_PROGRESS, STATUS.FAILED, "no_progress", "prime_agent");
 	}
+	if (watchdogCondition === FAILURE_KIND.REPEATED_TOOL_FAILURE) {
+		return result("failed", FAILURE_KIND.REPEATED_TOOL_FAILURE, STATUS.FAILED, "tool_loop", "prime_agent");
+	}
 	if (spawnFailed) {
 		return result("config_error", "spawn_error", STATUS.FAILED, "spawn", "environment");
 	}
@@ -396,6 +405,36 @@ export function shouldStopForNoChange({
 } = {}) {
 	if (!requireChange || changeDetected) return false;
 	return elapsedMs >= timeoutMs || toolCallCount >= maxToolCalls;
+}
+
+function stableErrorText(value) {
+	if (typeof value === "string") return value;
+	if (Array.isArray(value)) return value.map(stableErrorText).filter(Boolean).join(" ");
+	if (!value || typeof value !== "object") return "";
+	return ["text", "message", "error", "stderr", "content"]
+		.map((key) => stableErrorText(value[key]))
+		.filter(Boolean)
+		.join(" ");
+}
+
+export function recordRepeatedToolFailure(state = {}, event) {
+	if (event?.type !== "tool_execution_end") return state;
+	const status = String(event.result?.status ?? event.result?.details?.status ?? "").toLowerCase();
+	const failed = event.isError === true || event.result?.isError === true || ["error", "failed", "failure"].includes(status);
+	if (!failed) return { fingerprint: null, count: 0, toolName: null };
+	const toolName = String(event.toolName ?? "unknown");
+	const text = stableErrorText({
+		content: event.result?.content,
+		error: event.result?.error,
+		message: event.result?.message,
+		stderr: event.result?.stderr,
+	}).replace(/\s+/g, " ").trim().slice(0, 2048) || "unknown_error";
+	const fingerprint = `${toolName}\n${text}`;
+	return {
+		fingerprint,
+		count: state.fingerprint === fingerprint ? (state.count ?? 0) + 1 : 1,
+		toolName,
+	};
 }
 
 export function buildWorkerPromptArgument({ workerPrompt } = {}) {

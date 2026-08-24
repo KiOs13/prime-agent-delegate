@@ -181,12 +181,18 @@ test("--transport invalid exits with code 2 before creating out-dir", () => {
 	assert.equal(existsSync(outDir), false);
 });
 
-test("--prepare-command --transport cli includes the exact quoted transport args", () => {
+test("--prepare-command forwards transport and repeated failure limit", () => {
 	const cwd = createRepo();
 	const outDir = join(cwd, ".prime-delegate", "runs", "prepare-cli");
-	const result = runDelegate({ cwd, outDir, prompt: "prepare cli", args: ["--prepare-command", "--transport", "cli"] });
+	const result = runDelegate({
+		cwd,
+		outDir,
+		prompt: "prepare cli",
+		args: ["--prepare-command", "--transport", "cli", "--repeated-tool-failure-limit", "5"],
+	});
 	assert.equal(result.status, 0, result.stderr);
 	assert.match(result.stdout, /'--transport' 'cli'/);
+	assert.match(result.stdout, /'--repeated-tool-failure-limit' '5'/);
 });
 
 test("RPC handshake and prompt rejection are delegate transport failures", () => {
@@ -248,6 +254,36 @@ test("provider evidence is classified without retry", () => {
 		assert.equal(summary.failureOwner, "provider");
 		assert.equal(summary.restartCount, 0);
 	}
+});
+
+test("repeated tool failures after a change stop without retry and preserve the diff", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "repeated-tool-failure");
+	const result = runDelegate({
+		cwd,
+		outDir,
+		scenario: "repeated-tool-failure",
+		prompt: "make one change, then fail repeatedly",
+		args: [
+			"--autonomous",
+			"--require-change",
+			"--allow-change", "fake-prime-output.txt",
+			"--autonomous-gate", "test -f fake-prime-output.txt",
+			"--delegation-mode", "implement",
+			"--repeated-tool-failure-limit", "3",
+		],
+	});
+	assert.equal(result.status, 1, result.stderr);
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.terminalReason, "repeated_tool_failure");
+	assert.equal(summary.failureClass, "tool_loop");
+	assert.equal(summary.failureOwner, "prime_agent");
+	assert.equal(summary.restartCount, 0);
+	assert.equal(summary.repeatedToolFailureLimit, 3);
+	assert.equal(summary.repeatedToolFailureCount, 3);
+	assert.equal(summary.repeatedToolFailureTool, "ipython");
+	assert.equal(existsSync(join(cwd, "fake-prime-output.txt")), true);
+	assert.match(summary.worktreeDiff, /fake-prime-output\.txt/);
 });
 
 test("invalid task contract is owned by task_spec", () => {

@@ -141,6 +141,7 @@ Defaults:
 | `--restart-delay-ms` | 5000 |
 | `--no-change-timeout-ms` | 600000 |
 | `--no-change-max-tool-calls` | 80 |
+| `--repeated-tool-failure-limit` | 8 |
 | `--autonomous-max-continuations` | 3 |
 | `--autonomous-max-turns` | 12 |
 | `--autonomous-max-tokens` | 1000000 |
@@ -148,6 +149,9 @@ Defaults:
 Only startup silence, idle silence, or nonzero exit before the first valid event
 may receive a bounded infrastructure restart. Code, gate, protocol, timeout,
 configuration, and changed-worktree failures do not retry.
+After the first detected worktree change, the launcher also stops eight
+consecutive identical failed tool completions as `repeated_tool_failure`
+(`tool_loop`, owned by `prime_agent`) while preserving the partial worktree.
 
 Check an existing run without starting Prime:
 

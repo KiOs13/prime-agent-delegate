@@ -235,6 +235,13 @@ Add deterministic `failureClass` and `failureOwner`:
 Do not infer ownership from vague error words. Preserve current infrastructure
 restart behavior and do not add provider or CCR recovery in V2.
 
+After the first detected worktree change, stop consecutive identical failed
+`tool_execution_end` events at a configurable positive threshold (default 8).
+Normalize only stable tool/error content, omit raw error text from health and
+summary telemetry, classify the terminal result as `repeated_tool_failure`
+with class `tool_loop` and owner `prime_agent`, do not retry, and preserve the
+partial worktree for Codex takeover.
+
 ## Redaction and outcome
 
 Create one dependency-free structured sanitizer shared by audit and outcome
@@ -278,6 +285,7 @@ Cover:
 - missing `agent_end`;
 - malformed JSON and unmatched tools;
 - provider, gate, and Prime-limit classifications;
+- repeated identical tool failures after a change, reset behavior, and partial diff preservation;
 - semantic-compact capture;
 - nested and string redaction;
 - run manifest hashes;
