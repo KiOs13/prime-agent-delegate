@@ -168,6 +168,54 @@ test("repeated tool failure tracker ignores volatile fields and resets", () => {
 	}), { fingerprint: null, count: 0, toolName: null });
 });
 
+test("repeated tool failure in investigate mode detects errors without isError flag", () => {
+	// Simulate real IPython kernel crash: isError NOT set, error only in content text
+	let state = recordRepeatedToolFailure({}, {
+		type: "tool_execution_end",
+		toolCallId: "one",
+		toolName: "ipython",
+		result: { content: [{ type: "text", text: "Kernel has been shut down. stderr tail:" }] },
+	}, { investigate: true });
+	assert.equal(state.count, 1, "should detect kernel crash from content text");
+
+	state = recordRepeatedToolFailure(state, {
+		type: "tool_execution_end",
+		toolCallId: "two",
+		toolName: "ipython",
+		result: { content: [{ type: "text", text: "Kernel has been shut down. stderr tail:" }] },
+	}, { investigate: true });
+	assert.equal(state.count, 2, "should increment on same fingerprint");
+
+	// Non-error result resets even in investigate mode
+	state = recordRepeatedToolFailure(state, {
+		type: "tool_execution_end",
+		toolName: "ipython",
+		result: { content: "all good" },
+	}, { investigate: true });
+	assert.deepEqual(state, { fingerprint: null, count: 0, toolName: null });
+
+	// Different error pattern also detected
+	state = recordRepeatedToolFailure({}, {
+		type: "tool_execution_end",
+		toolName: "ipython",
+		result: { content: "forked kernel exited unexpectedly pid=12345" },
+	}, { investigate: true });
+	assert.equal(state.count, 1, "should detect forked kernel crash");
+});
+
+test("repeated tool failure in implement mode ignores errors without isError flag", () => {
+	// In implement/prototype mode, errors without isError should NOT be counted
+	// to protect partial diff from premature termination
+	const state = recordRepeatedToolFailure({}, {
+		type: "tool_execution_end",
+		toolCallId: "one",
+		toolName: "ipython",
+		result: { content: [{ type: "text", text: "Kernel has been shut down" }] },
+	}, { investigate: false });
+	assert.deepEqual(state, { fingerprint: null, count: 0, toolName: null },
+		"implement mode should not detect content-only errors");
+});
+
 test("repeated tool failures are terminal Prime loops", () => {
 	const cls = classifyChildExit({ watchdogCondition: FAILURE_KIND.REPEATED_TOOL_FAILURE });
 	assert.equal(cls.kind, "failed");

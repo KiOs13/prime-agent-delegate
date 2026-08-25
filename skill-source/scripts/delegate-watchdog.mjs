@@ -440,11 +440,36 @@ function stableErrorText(value) {
 		.join(" ");
 }
 
-export function recordRepeatedToolFailure(state = {}, event) {
+const INVESTIGATE_ERROR_PATTERNS = [
+	/kernel has been shut down/i,
+	/kernel exited unexpectedly/i,
+	/forked kernel exited/i,
+	/kernel.*crash/i,
+	/ENOENT/i,
+	/ECONNREFUSED/i,
+	/ETIMEDOUT/i,
+	/permission denied/i,
+	/no such file or directory/i,
+];
+
+export function recordRepeatedToolFailure(state = {}, event, { investigate = false } = {}) {
 	if (event?.type !== "tool_execution_end") return state;
 	const status = String(event.result?.status ?? event.result?.details?.status ?? "").toLowerCase();
 	const failed = event.isError === true || event.result?.isError === true || ["error", "failed", "failure"].includes(status);
-	if (!failed) return { fingerprint: null, count: 0, toolName: null };
+	if (!failed) {
+		if (!investigate) return { fingerprint: null, count: 0, toolName: null };
+		// In investigate mode, also detect errors from tool result content text
+		// (e.g. "Kernel has been shut down" without isError flag)
+		const text = stableErrorText({
+			content: event.result?.content,
+			error: event.result?.error,
+			message: event.result?.message,
+			stderr: event.result?.stderr,
+		}).replace(/\s+/g, " ").trim().slice(0, 2048);
+		if (!text || !INVESTIGATE_ERROR_PATTERNS.some((re) => re.test(text))) {
+			return { fingerprint: null, count: 0, toolName: null };
+		}
+	}
 	const toolName = String(event.toolName ?? "unknown");
 	const text = stableErrorText({
 		content: event.result?.content,

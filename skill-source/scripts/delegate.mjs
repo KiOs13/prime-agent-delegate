@@ -786,7 +786,7 @@ function onValidEvent(event) {
 		}
 	}
 	if (event?.type === "tool_execution_end") {
-		repeatedToolFailure = recordRepeatedToolFailure(repeatedToolFailure, event);
+		repeatedToolFailure = recordRepeatedToolFailure(repeatedToolFailure, event, { investigate: !options.requireChange });
 		health = updateHealth(health, {
 			repeatedToolFailureCount: repeatedToolFailure.count,
 			repeatedToolFailureTool: repeatedToolFailure.toolName,
