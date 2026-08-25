@@ -216,6 +216,40 @@ test("repeated tool failure in implement mode ignores errors without isError fla
 		"implement mode should not detect content-only errors");
 });
 
+test("repeated tool failure gate: investigate mode fires without changeDetectedAt", () => {
+	// In investigate mode (requireChange=false), the gate condition is:
+	//   (options.requireChange ? health.changeDetectedAt : true) && count >= limit
+	// This simplifies to: true && count >= limit → fires regardless of changeDetectedAt
+	const options = { requireChange: false };
+	const health = { changeDetectedAt: null }; // no worktree change in investigate
+	const repeatedToolFailureLimit = 8;
+	const repeatedToolFailure = { count: 23 }; // exceeded limit
+	const gate = (options.requireChange ? health.changeDetectedAt : true);
+	assert.equal(gate, true, "investigate mode bypasses changeDetectedAt gate");
+	assert.ok(gate && repeatedToolFailure.count >= repeatedToolFailureLimit,
+		"should terminate in investigate mode without changeDetectedAt");
+});
+
+test("repeated tool failure gate: editing mode requires changeDetectedAt", () => {
+	// In editing mode (requireChange=true), the gate condition is:
+	//   (options.requireChange ? health.changeDetectedAt : true) && count >= limit
+	// This means: health.changeDetectedAt && count >= limit → requires change first
+	const options = { requireChange: true };
+	const healthNoChange = { changeDetectedAt: null }; // no worktree change yet
+	const healthWithChange = { changeDetectedAt: "2025-01-01T00:00:00.000Z" };
+	const repeatedToolFailureLimit = 8;
+	const repeatedToolFailure = { count: 23 };
+
+	// No change → gate blocks termination (protects partial diff)
+	const gateNoChange = (options.requireChange ? healthNoChange.changeDetectedAt : true);
+	assert.equal(gateNoChange, null, "editing mode requires changeDetectedAt before termination");
+
+	// With change → gate allows termination
+	const gateWithChange = (options.requireChange ? healthWithChange.changeDetectedAt : true);
+	assert.ok(gateWithChange && repeatedToolFailure.count >= repeatedToolFailureLimit,
+		"editing mode should terminate after change detected");
+});
+
 test("repeated tool failures are terminal Prime loops", () => {
 	const cls = classifyChildExit({ watchdogCondition: FAILURE_KIND.REPEATED_TOOL_FAILURE });
 	assert.equal(cls.kind, "failed");

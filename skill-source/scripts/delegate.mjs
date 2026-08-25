@@ -792,7 +792,7 @@ function onValidEvent(event) {
 			repeatedToolFailureTool: repeatedToolFailure.toolName,
 			now,
 		});
-		if (repeatedToolFailure.count >= repeatedToolFailureLimit) {
+		if ((options.requireChange ? health.changeDetectedAt : true) && repeatedToolFailure.count >= repeatedToolFailureLimit) {
 			pendingCondition = FAILURE_KIND.REPEATED_TOOL_FAILURE;
 			appendSyntheticEvent({
 				kind: FAILURE_KIND.REPEATED_TOOL_FAILURE,
