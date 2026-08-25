@@ -119,6 +119,8 @@ const repeatedToolInvocations = [...invocationCounts.entries()]
 	.slice(0, MAX_ITEMS);
 const turnsUsed = eventTypes.turn_end ?? eventTypes.turn_start ?? 0;
 const configuredMaxTurns = Number(run.autonomousMaxTurns) || null;
+const totalToolCalls = Object.values(tools).reduce((acc, t) => acc + (t.started || 0), 0);
+const failedToolCalls = Object.values(tools).reduce((acc, t) => acc + (t.failed || 0), 0);
 
 const audit = {
 	schemaVersion: 1,
@@ -137,6 +139,8 @@ const audit = {
 		turnLimitOvershoot: configuredMaxTurns === null ? 0 : Math.max(0, turnsUsed - configuredMaxTurns),
 		completionGateConfigured: (Number(run.autonomousGateCount) || 0) > 0,
 		terminalAssistantMessagePresent: Boolean(run.finalText),
+		totalToolCalls,
+		failedToolCalls,
 		finalText: compact(run.finalText, 2000),
 	},
 	source: {

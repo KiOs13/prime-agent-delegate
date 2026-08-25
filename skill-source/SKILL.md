@@ -83,8 +83,9 @@ compatibility fallback.
 Prime's downstream CCR can replace user messages even when RPC delivery is
 byte-perfect. Tools-enabled runs therefore always store the task in
 `task-parts/manifest.json`; RPC or CLI carries only the short manifest
-instruction. `--no-tools` cannot read files, so it remains inline-only and
-limited to effective prompts of at most 1024 UTF-8 bytes.
+instruction directing Prime to batch-read all task parts and stitch them
+into the complete task prompt before execution. `--no-tools` cannot read files,
+so it remains inline-only and limited to effective prompts of at most 1024 UTF-8 bytes.
 
 Optional metadata:
 
@@ -112,7 +113,7 @@ remains supported.
 Each run retains:
 
 - `events.jsonl`, `stderr.log`, and `worker-prompt.md`;
-- `health.json`, `summary.json`, and `audit-summary.json`;
+- `health.json`, `summary.json`, and `audit-summary.json` (enriched with tool call stats `totalToolCalls` and `failedToolCalls`);
 - `run-manifest.json`;
 - split `task-parts/` for large content regardless of RPC or CLI process mode;
 - `codex-outcome.json` after Codex review.
