@@ -316,6 +316,28 @@ test("repeated tool failures after a change stop without retry and preserve the 
 	assert.match(summary.worktreeDiff, /fake-prime-output\.txt/);
 });
 
+test("repeated tool failures in a no-change read-only run stop at the configured limit", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "repeated-tool-failure-no-change");
+	const result = runDelegate({
+		cwd,
+		outDir,
+		scenario: "repeated-tool-failure",
+		prompt: "investigate, then fail repeatedly without any file change",
+		args: ["--repeated-tool-failure-limit", "3"],
+	});
+	assert.equal(result.status, 1, result.stderr);
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.terminalReason, "repeated_tool_failure");
+	assert.equal(summary.failureClass, "tool_loop");
+	assert.equal(summary.failureOwner, "prime_agent");
+	assert.equal(summary.restartCount, 0);
+	assert.equal(summary.repeatedToolFailureLimit, 3);
+	assert.equal(summary.repeatedToolFailureCount, 3);
+	assert.equal(summary.repeatedToolFailureTool, "ipython");
+	assert.equal(existsSync(join(cwd, "fake-prime-output.txt")), false);
+});
+
 test("launcher stops autonomous runs on the first turn beyond the configured limit", () => {
 	const cwd = createRepo();
 	const outDir = join(cwd, ".prime-delegate", "runs", "max-turns");

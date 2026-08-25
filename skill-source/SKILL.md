@@ -152,9 +152,9 @@ Defaults:
 Only startup silence, idle silence, or nonzero exit before the first valid event
 may receive a bounded infrastructure restart. Code, gate, protocol, timeout,
 configuration, and changed-worktree failures do not retry.
-After the first detected worktree change, the launcher also stops eight
-consecutive identical failed tool completions as `repeated_tool_failure`
-(`tool_loop`, owned by `prime_agent`) while preserving the partial worktree.
+The launcher also stops eight consecutive identical failed tool
+completions as `repeated_tool_failure` (`tool_loop`, owned by `prime_agent`)
+while preserving the partial worktree.
 `--require-change` is also checked by the launcher at process completion; exit
 0 without a worktree change fails as `required_change_missing`.
 `--autonomous-max-turns <N>` is an optional explicit guard. When set, the
