@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 
-const script = join(import.meta.dirname, "record-outcome.mjs");
+const script = join(import.meta.dirname, "..", "skill-source", "scripts", "record-outcome.mjs");
 
 function run(args) {
 	return spawnSync(process.execPath, [script, ...args], { encoding: "utf8" });

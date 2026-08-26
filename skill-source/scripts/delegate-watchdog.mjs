@@ -3,7 +3,7 @@
 // scripts/delegate-watchdog.mjs
 //
 // Pure watchdog decision and health helpers for scripts/delegate.mjs.
-// Dependency-free so the unit tests in scripts/test-delegate-watchdog.mjs
+// Dependency-free so the unit tests in tests/test-delegate-watchdog.mjs
 // can run without Prime Agent, WSL, network, or credentials.
 //
 // The launcher injects the real Windows process-liveness probe

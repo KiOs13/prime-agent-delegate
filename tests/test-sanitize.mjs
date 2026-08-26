@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { isSecretKey, sanitize, sanitizeString } from "./sanitize.mjs";
+import { isSecretKey, sanitize, sanitizeString } from "../skill-source/scripts/sanitize.mjs";
 
 test("redacts the exact structured secret keys recursively", () => {
 	const keys = [

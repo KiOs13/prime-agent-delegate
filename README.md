@@ -64,7 +64,7 @@ Run the emitted command with `wsl bash -lc`.
 Run the complete suite inside Ubuntu WSL so Windows paths, WSL Git preflight, and the fake Prime executable use the same runtime boundary as production:
 
 ```powershell
-wsl bash -lc "cd /mnt/c/path/to/Prime-agent-delegate && node --test skill-source/scripts/test-*.mjs"
+wsl bash -lc "cd /mnt/c/path/to/Prime-agent-delegate && node --test tests/test-*.mjs"
 ```
 
 No network or real model calls are required by the test suite.

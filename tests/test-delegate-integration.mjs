@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
-const DELEGATE = join(SCRIPT_DIR, "delegate.mjs");
+const DELEGATE = join(SCRIPT_DIR, "..", "skill-source", "scripts", "delegate.mjs");
 const FAKE_PRIME = join(SCRIPT_DIR, "fake-prime-agent.mjs");
 
 function createRepo({ ignored = true } = {}) {

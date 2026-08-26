@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// scripts/test-summarize-events.mjs
+// tests/test-summarize-events.mjs
 //
 // Unit tests for summarize-events.mjs, covering tool call statistics
 // (totalToolCalls, failedToolCalls) and basic event processing.
@@ -14,7 +14,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const SCRIPT_DIR = fileURLToPath(new URL(".", import.meta.url));
-const SUMMARIZE = join(SCRIPT_DIR, "summarize-events.mjs");
+const SUMMARIZE = join(SCRIPT_DIR, "..", "skill-source", "scripts", "summarize-events.mjs");
 
 function writeEvents(path, events) {
     const lines = events.map((e) => JSON.stringify(e)).join("\n") + "\n";

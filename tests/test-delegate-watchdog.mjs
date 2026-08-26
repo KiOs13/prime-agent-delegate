@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// scripts/test-delegate-watchdog.mjs
+// tests/test-delegate-watchdog.mjs
 //
 // Dependency-free unit tests for the delegate watchdog decisions and health
 // helpers. No Prime Agent, WSL, network, or credentials are touched.
@@ -45,7 +45,7 @@ import {
 	shouldStopForNoChange,
 	splitUtf8ByBytes,
 	terminalStatusFor,
-} from "./delegate-watchdog.mjs";
+} from "../skill-source/scripts/delegate-watchdog.mjs";
 
 const ALIVE_PID = 4242;
 const dead = () => false;
