@@ -7,7 +7,7 @@ description: Delegate bounded implementation, prototyping, investigation, or tes
 
 Use `/usr/bin/prime-agent` in the local `Ubuntu` WSL distribution. Reuse its
 current configuration and credentials. Do not install, update, log out, or
-expose credentials. Prime Agent `0.8.0` is the verified runtime.
+expose credentials. Prime Agent `0.8.1` is the verified runtime.
 
 ## Authority
 
@@ -107,8 +107,11 @@ The V2 default is:
 
 Any output inside the worktree must already be ignored by Git. The launcher
 fails before model inference and before creating artifacts otherwise. It never
-changes `.gitignore` or `.git/info/exclude`. An explicit external `--out-dir`
-remains supported.
+changes `.gitignore` or `.git/info/exclude`. Do not store Prime run artifacts
+under `.codex/visualizations`; that directory is for rendered artifacts, not
+delegation history. Use an explicit external `--out-dir` only when the default
+directory cannot be Git-ignored, and place it under
+`<Codex home>/prime-delegate/runs/<threadId>/<runId>/`.
 
 Each run retains:
 
