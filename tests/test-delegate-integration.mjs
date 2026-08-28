@@ -32,7 +32,7 @@ function runDelegate({ cwd, prompt, outDir, scenario = "normal", args = [], env 
 		"--wsl-mode",
 		"--cwd", cwd,
 		"--prompt-file", promptFile,
-		"--out-dir", outDir,
+		...(outDir ? ["--out-dir", outDir] : []),
 		"--timeout-ms", "15000",
 		"--startup-grace-ms", "5000",
 		"--idle-timeout-ms", "5000",
@@ -190,6 +190,17 @@ test("--require-change fails closed when Prime exits zero without an edit", () =
 	assert.equal(existsSync(join(cwd, "fake-prime-output.txt")), false);
 });
 
+test("terminal run writes a completion marker into the delegated worktree", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "completion-marker");
+	const result = runDelegate({ cwd, outDir, prompt: "completion marker" });
+	assert.equal(result.status, 0, result.stderr);
+	const marker = JSON.parse(readFileSync(join(cwd, ".prime-task-complete.json"), "utf8"));
+	assert.equal(marker.status, "completed");
+	assert.match(marker.runId, /^[0-9a-f-]{36}$/);
+	assert.match(marker.finishedAt, /^\d{4}-/);
+});
+
 test("--repeated-tool-failure-limit rejects zero before creating out-dir", () => {
 	const cwd = createRepo();
 	const outDir = join(cwd, ".prime-delegate", "runs", "bad-repeated-limit");
@@ -223,6 +234,20 @@ test("--prepare-command forwards transport and repeated failure limit", () => {
 	assert.equal(result.status, 0, result.stderr);
 	assert.match(result.stdout, /'--transport' 'cli'/);
 	assert.match(result.stdout, /'--repeated-tool-failure-limit' '5'/);
+});
+
+test("--prepare-command defaults out-dir to Codex home with run id", () => {
+	const cwd = createRepo();
+	const result = runDelegate({
+		cwd,
+		prompt: "prepare default out",
+		args: ["--prepare-command", "--project-id", "nmon_1.9", "--thread-id", "thread-42"],
+	});
+	assert.equal(result.status, 0, result.stderr);
+	assert.match(result.stdout, /'--out-dir' '\/mnt\/c\/Project\/_Prime\/runs\/nmon_1\.9\/thread-42\/[0-9a-f-]{36}'/);
+	assert.match(result.stdout, /'--run-id' '[0-9a-f-]{36}'/);
+	assert.match(result.stdout, /'--thread-id' 'thread-42'/);
+	assert.match(result.stdout, /'--project-id' 'nmon_1\.9'/);
 });
 
 test("RPC handshake and prompt rejection are delegate transport failures", () => {
@@ -478,7 +503,7 @@ test("metadata validation, implement gates, and backward-compatible invocation",
 	assert.equal(summary.delegationMode, "implement");
 	assert.equal(summary.taskType, "implementation");
 	const status = spawnSync("git", ["status", "--porcelain"], { cwd, encoding: "utf8" }).stdout.trim();
-	assert.equal(status, "?? fake-prime-output.txt");
+	assert.equal(status, ["?? .prime-task-complete.json", "?? fake-prime-output.txt"].join("\n"));
 });
 
 test("production ignores a fake executable unless test mode is enabled", () => {

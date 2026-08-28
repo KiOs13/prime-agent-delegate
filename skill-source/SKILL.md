@@ -34,8 +34,10 @@ node <skill-dir>\scripts\delegate.mjs --check
 
 3. Write a self-contained task with scope, constraints, gates, and:
    `Do not commit. Work only inside the supplied cwd.`
-4. For edits, create a separate `codex/prime-agent-<slug>` worktree. Never let
-   Prime and Codex edit the same worktree concurrently.
+4. For edits, create a separate `codex/prime-agent-<slug>` worktree under
+   `C:\Project\_Prime\worktrees\<project>\<slug>`, where `<project>` is the
+   repository directory name. Never let Prime and Codex edit the same
+   worktree concurrently.
 5. Keep the task file outside the delegated worktree or under ignored `.codex/`.
 6. Generate the WSL command:
 
@@ -45,6 +47,15 @@ node <skill-dir>\scripts\delegate.mjs --prepare-command `
   --prompt-file <absolute-windows-task-file> `
   --out-dir <absolute-windows-output-directory>
 ```
+
+The generated command always stores run artifacts outside the delegated
+worktree. By default `--prepare-command` resolves the output directory to
+`C:\Project\_Prime\runs\<project>\<threadId>\<runId>` and passes it to the
+launcher as an explicit `--out-dir` together with the matching `--run-id`.
+Pass `--project-id <id>` to group runs by repository directory name and
+`--thread-id <id>` to group runs by Codex thread; without them the path uses
+the `default` segment. An explicit `--out-dir` on `--prepare-command` still
+overrides this location.
 
 7. Run the emitted command with `wsl bash -lc`.
 8. Read `summary.json` and `audit-summary.json` first. Query `events.jsonl` only
@@ -99,19 +110,16 @@ Optional metadata:
 
 ## Run storage
 
-The V2 default is:
+Run artifacts are stored outside the delegated worktree:
 
 ```text
-<target>/.prime-delegate/runs/<runId>/
+C:\Project\_Prime\runs\<project>\<threadId>\<runId>\
 ```
 
-Any output inside the worktree must already be ignored by Git. The launcher
-fails before model inference and before creating artifacts otherwise. It never
-changes `.gitignore` or `.git/info/exclude`. Do not store Prime run artifacts
-under `.codex/visualizations`; that directory is for rendered artifacts, not
-delegation history. Use an explicit external `--out-dir` only when the default
-directory cannot be Git-ignored, and place it under
-`<Codex home>/prime-delegate/runs/<threadId>/<runId>/`.
+The `--prepare-command` step resolves this path automatically, so run output
+never pollutes Git state and never depends on repo-local ignore rules. Do not
+store Prime run artifacts under `.codex/visualizations`; that directory is for
+rendered artifacts, not delegation history.
 
 Each run retains:
 
@@ -134,6 +142,36 @@ node <skill-dir>\scripts\record-outcome.mjs `
   --verdict ACCEPTED `
   --prime-value HIGH
 ```
+
+When a run terminates, the launcher writes a completion marker
+`.prime-task-complete.json` into the delegated worktree. After Codex has
+integrated or discarded the result, remove the worktree with the cleanup
+command of your choice; the marker makes completed worktrees safe to identify
+and delete in bulk.
+
+## Cleanup
+
+Identify and remove stale delegated worktrees:
+
+```powershell
+node <skill-dir>\scripts\cleanup-worktrees.mjs `
+  [--project <name>] [--min-age-hours <N>] [--apply] [--delete-branches]
+```
+
+A worktree is a cleanup candidate only when all of these hold:
+
+- `.prime-task-complete.json` exists with a valid `runId` and `finishedAt`;
+- the marker is at least `--min-age-hours` old (default 168 = 7 days);
+`git status --porcelain` in the worktree shows nothing except the marker
+itself.
+
+The script scans `C:\Project\_Prime\worktrees\<project>\<slug>` and never
+touches worktrees without a marker, with any Git diff beyond the marker, with
+an invalid marker, or whose main repository cannot be verified. Dry-run is the
+default and prints a candidate table; pass `--apply` to delete. Branch
+deletion requires the explicit `--delete-branches` flag and uses only
+`git branch -d` (merged-only); unmerged branches stay with a warning.
+Always review the dry-run output before `--apply`.
 
 ## Watchdog
 

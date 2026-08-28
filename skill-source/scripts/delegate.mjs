@@ -73,6 +73,7 @@ function parseArgs(argv) {
 	const options = { check: false, noTools: false, autonomous: false, autonomousGates: [], allowedChanges: [], fullEvents: false, requireChange: false, wslMode: false, prepareCommand: false };
 	const valueArgs = new Set([
 		"--cwd", "--prompt-file", "--out-dir", "--timeout-ms", "--provider", "--model", "--thinking",
+		"--thread-id", "--run-id", "--project-id",
 		"--task-id", "--work-package-id", "--task-type", "--delegation-mode", "--transport",
 		"--autonomous-max-continuations", "--autonomous-max-turns", "--autonomous-max-tokens",
 		"--startup-grace-ms", "--idle-timeout-ms", "--max-infra-restarts", "--restart-delay-ms",
@@ -381,10 +382,20 @@ try {
 }
 
 if (options.prepareCommand) {
+	const runId = randomUUID();
+	const threadId = options.threadId ?? "default";
+	const projectId = options.projectId ?? "default";
+	// Artifacts live outside the delegated worktree so run output never
+	// pollutes Git state and never depends on repo-local ignore rules.
+	const runsRoot = "C:\\Project\\_Prime\\runs";
+	const resolvedOutDir = options.outDir ?? join(runsRoot, projectId, threadId, runId);
 	const parts = ["/usr/bin/node", windowsPathToWslPath(join(SCRIPT_DIR, "delegate.mjs")), "--wsl-mode"];
 	if (options.cwd) parts.push("--cwd", windowsPathToWslPath(options.cwd));
 	if (options.promptFile) parts.push("--prompt-file", windowsPathToWslPath(options.promptFile));
-	if (options.outDir) parts.push("--out-dir", windowsPathToWslPath(options.outDir));
+	parts.push("--out-dir", windowsPathToWslPath(resolvedOutDir));
+	parts.push("--run-id", runId);
+	if (options.threadId) parts.push("--thread-id", options.threadId);
+	if (options.projectId) parts.push("--project-id", options.projectId);
 	if (options.timeoutMs) parts.push("--timeout-ms", options.timeoutMs);
 	if (options.startupGraceMs) parts.push("--startup-grace-ms", options.startupGraceMs);
 	if (options.idleTimeoutMs) parts.push("--idle-timeout-ms", options.idleTimeoutMs);
@@ -464,7 +475,7 @@ if (options.noTools && effectiveTaskContractBytes > INLINE_TASK_MAX_BYTES) {
 	fail(`--no-tools effective payload exceeds ${INLINE_TASK_MAX_BYTES} UTF-8 bytes`);
 }
 
-const runId = randomUUID();
+const runId = options.runId ?? randomUUID();
 const wslCwd = toWslPath(cwd);
 const gitContext = resolveWslGitContext(cwd, wslCwd);
 const outDir = resolve(options.outDir ?? join(cwd, ".prime-delegate", "runs", runId));
@@ -1226,7 +1237,23 @@ function finalize(status, reason, decisionReason, worktreeDiff) {
 	health = recordTerminal(health, { status, reason });
 	flushHealth();
 
+	// Marker for later worktree cleanup. Written after all Git checks and
+	// diff capture so it never affects read-only or allowlist validation.
+	const taskCompleteMarker = {
+		runId,
+		status,
+		terminalReason: reason,
+		taskId: runMetadata?.taskId ?? null,
+	};
+	try {
+		writeFileSync(join(cwd, ".prime-task-complete.json"), JSON.stringify(taskCompleteMarker, null, 2) + "\n", "utf8");
+	} catch {}
+
 	const finishedAt = new Date().toISOString();
+	taskCompleteMarker.finishedAt = finishedAt;
+	try {
+		writeFileSync(join(cwd, ".prime-task-complete.json"), JSON.stringify(taskCompleteMarker, null, 2) + "\n", "utf8");
+	} catch {}
 	const summary = {
 		schemaVersion: SUMMARY_SCHEMA_VERSION,
 		runId,

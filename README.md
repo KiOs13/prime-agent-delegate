@@ -52,12 +52,16 @@ node "$env:USERPROFILE\.codex\skills\prime-agent-delegate\scripts\delegate.mjs" 
   --prepare-command `
   --cwd C:\path\to\repo `
   --prompt-file C:\path\to\task.md `
-  --out-dir C:\path\to\repo\.prime-delegate\runs\example `
   --delegation-mode investigate `
   --task-type investigation
 ```
 
 Run the emitted command with `wsl bash -lc`.
+
+Run artifacts are stored outside the repository by default under
+`C:\Project\_Prime\runs\<project>\<threadId>\<runId>`. Pass
+`--project-id` and `--thread-id` to group runs by project and Codex thread,
+or an explicit `--out-dir` to override the location.
 
 ## Tests
 
