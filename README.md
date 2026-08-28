@@ -59,7 +59,7 @@ node "$env:USERPROFILE\.codex\skills\prime-agent-delegate\scripts\delegate.mjs" 
 Run the emitted command with `wsl bash -lc`.
 
 Run artifacts are stored outside the repository by default under
-`C:\Project\_Prime\runs\<project>\<threadId>\<runId>`. Pass
+`C:\Project-Prime\runs\<project>\<threadId>\<runId>`. Pass
 `--project-id` and `--thread-id` to group runs by project and Codex thread,
 or an explicit `--out-dir` to override the location.
 
@@ -77,7 +77,7 @@ No network or real model calls are required by the test suite.
 
 Prime Agent output is always a candidate result. Codex retains responsibility for scope, review, corrections, commits, and production actions.
 
-`--allow-change` validates the final Git paths but is not an operating-system sandbox. Do not put secrets in prompts, command lines, or task files. Run artifacts are stored outside the repository by default and may contain repository data, so keep the `C:\Project\_Prime` directory out of any publicly accessible location.
+`--allow-change` validates the final Git paths but is not an operating-system sandbox. Do not put secrets in prompts, command lines, or task files. Run artifacts are stored outside the repository by default and may contain repository data, so keep the `C:\Project-Prime` directory out of any publicly accessible location.
 
 See [SECURITY.md](SECURITY.md) for reporting guidance and supported security assumptions.
 

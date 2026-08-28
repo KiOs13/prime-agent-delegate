@@ -387,7 +387,7 @@ if (options.prepareCommand) {
 	const projectId = options.projectId ?? "default";
 	// Artifacts live outside the delegated worktree so run output never
 	// pollutes Git state and never depends on repo-local ignore rules.
-	const runsRoot = "C:\\Project\\_Prime\\runs";
+	const runsRoot = "C:\\Project-Prime\\runs";
 	const resolvedOutDir = options.outDir ?? join(runsRoot, projectId, threadId, runId);
 	const parts = ["/usr/bin/node", windowsPathToWslPath(join(SCRIPT_DIR, "delegate.mjs")), "--wsl-mode"];
 	if (options.cwd) parts.push("--cwd", windowsPathToWslPath(options.cwd));

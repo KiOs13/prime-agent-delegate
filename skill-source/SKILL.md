@@ -35,7 +35,7 @@ node <skill-dir>\scripts\delegate.mjs --check
 3. Write a self-contained task with scope, constraints, gates, and:
    `Do not commit. Work only inside the supplied cwd.`
 4. For edits, create a separate `codex/prime-agent-<slug>` worktree under
-   `C:\Project\_Prime\worktrees\<project>\<slug>`, where `<project>` is the
+   `C:\Project-Prime\worktrees\<project>\<slug>`, where `<project>` is the
    repository directory name. Never let Prime and Codex edit the same
    worktree concurrently.
 5. Keep the task file outside the delegated worktree or under ignored `.codex/`.
@@ -50,7 +50,7 @@ node <skill-dir>\scripts\delegate.mjs --prepare-command `
 
 The generated command always stores run artifacts outside the delegated
 worktree. By default `--prepare-command` resolves the output directory to
-`C:\Project\_Prime\runs\<project>\<threadId>\<runId>` and passes it to the
+`C:\Project-Prime\runs\<project>\<threadId>\<runId>` and passes it to the
 launcher as an explicit `--out-dir` together with the matching `--run-id`.
 Pass `--project-id <id>` to group runs by repository directory name and
 `--thread-id <id>` to group runs by Codex thread; without them the path uses
@@ -113,7 +113,7 @@ Optional metadata:
 Run artifacts are stored outside the delegated worktree:
 
 ```text
-C:\Project\_Prime\runs\<project>\<threadId>\<runId>\
+C:\Project-Prime\runs\<project>\<threadId>\<runId>\
 ```
 
 The `--prepare-command` step resolves this path automatically, so run output
@@ -165,7 +165,7 @@ A worktree is a cleanup candidate only when all of these hold:
 `git status --porcelain` in the worktree shows nothing except the marker
 itself.
 
-The script scans `C:\Project\_Prime\worktrees\<project>\<slug>` and never
+The script scans `C:\Project-Prime\worktrees\<project>\<slug>` and never
 touches worktrees without a marker, with any Git diff beyond the marker, with
 an invalid marker, or whose main repository cannot be verified. Dry-run is the
 default and prints a candidate table; pass `--apply` to delete. Branch

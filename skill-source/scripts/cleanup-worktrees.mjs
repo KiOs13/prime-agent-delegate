@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 
 const WORKTREES_ROOT = process.env.PRIME_DELEGATE_WORKTREES_ROOT
 	? resolve(process.env.PRIME_DELEGATE_WORKTREES_ROOT)
-	: "C:\\Project\\_Prime\\worktrees";
+	: "C:\\Project-Prime\\worktrees";
 const DEFAULT_MIN_AGE_HOURS = 168;
 const MARKER_NAME = ".prime-task-complete.json";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

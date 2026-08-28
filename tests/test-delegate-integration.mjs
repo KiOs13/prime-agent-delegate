@@ -244,7 +244,7 @@ test("--prepare-command defaults out-dir to Codex home with run id", () => {
 		args: ["--prepare-command", "--project-id", "nmon_1.9", "--thread-id", "thread-42"],
 	});
 	assert.equal(result.status, 0, result.stderr);
-	assert.match(result.stdout, /'--out-dir' '\/mnt\/c\/Project\/_Prime\/runs\/nmon_1\.9\/thread-42\/[0-9a-f-]{36}'/);
+	assert.match(result.stdout, /'--out-dir' '\/mnt\/c\/Project-Prime\/runs\/nmon_1\.9\/thread-42\/[0-9a-f-]{36}'/);
 	assert.match(result.stdout, /'--run-id' '[0-9a-f-]{36}'/);
 	assert.match(result.stdout, /'--thread-id' 'thread-42'/);
 	assert.match(result.stdout, /'--project-id' 'nmon_1\.9'/);
