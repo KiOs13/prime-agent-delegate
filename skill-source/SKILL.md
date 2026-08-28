@@ -38,7 +38,10 @@ node <skill-dir>\scripts\delegate.mjs --check
    `C:\Project-Prime\worktrees\<project>\<slug>`, where `<project>` is the
    repository directory name. Never let Prime and Codex edit the same
    worktree concurrently.
-5. Keep the task file outside the delegated worktree or under ignored `.codex/`.
+5. Keep the task file outside the delegated worktree, under
+   `C:\Project-Prime\runs\<project>\` next to that project's run folders
+   (for example `C:\Project-Prime\runs\Prime-agent-delegate\smoke-task.md`),
+   or under ignored `.codex/` in the repository.
 6. Generate the WSL command:
 
 ```powershell
