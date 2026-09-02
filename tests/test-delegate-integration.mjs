@@ -192,6 +192,54 @@ test("explicit CLI transport selects inline for short tasks and task-parts above
 	for (const part of taskManifest.parts) assert.equal(sha256(join(partsOut, "task-parts", part.name)), part.sha256);
 });
 
+test("no-change watchdog still stops a hanging worker after prompt acceptance", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "no-change-hang");
+	const result = runDelegate({
+		cwd,
+		outDir,
+		scenario: "hang-after-prompt",
+		prompt: "hang without changes",
+		args: [
+			"--autonomous",
+			"--require-change",
+			"--autonomous-gate", "true",
+			"--delegation-mode", "implement",
+			"--no-change-timeout-ms", "800",
+			"--max-infra-restarts", "0",
+		],
+	});
+	assert.equal(result.status, 1, result.stderr);
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.status, "failed");
+	assert.equal(summary.terminalReason, "no_change_progress");
+});
+
+test("no-change window starts at RPC prompt acceptance, not at spawn", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "no-change-deferred-window");
+	const result = runDelegate({
+		cwd,
+		outDir,
+		scenario: "normal",
+		prompt: "make a change after a slow prompt handshake",
+		args: [
+			"--autonomous",
+			"--require-change",
+			"--allow-change", "fake-prime-output.txt",
+			"--autonomous-gate", "true",
+			"--delegation-mode", "implement",
+			"--no-change-timeout-ms", "1500",
+		],
+		env: { PRIME_AGENT_DELEGATE_FAKE_PROMPT_DELAY_MS: "2500" },
+	});
+	assert.equal(result.status, 0, result.stderr);
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.status, "completed");
+	assert.equal(summary.transport.promptAccepted, true);
+	assert.equal(existsSync(join(cwd, "fake-prime-output.txt")), true);
+});
+
 test("--require-change fails closed when Prime exits zero without an edit", () => {
 	const cwd = createRepo();
 	const outDir = join(cwd, ".prime-delegate", "runs", "required-change-missing");

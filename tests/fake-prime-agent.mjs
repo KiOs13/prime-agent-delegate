@@ -18,7 +18,7 @@ const scenario = process.env.PRIME_AGENT_DELEGATE_FAKE_SCENARIO ?? "normal";
 const cwdIndex = args.indexOf("--cwd");
 const cwd = cwdIndex >= 0 ? args[cwdIndex + 1] : null;
 function makeChange() {
-	if (scenario === "no-change") return;
+	if (scenario === "no-change" || scenario === "hang-after-prompt") return;
 	if (!(args.includes("--autonomous") || process.env.PRIME_AGENT_DELEGATE_FAKE_FORCE_CHANGE === "1") || !cwd || !existsSync(cwd)) return;
 	writeFileSync(
 		join(cwd, process.env.PRIME_AGENT_DELEGATE_FAKE_CHANGE ?? "fake-prime-output.txt"),
@@ -122,6 +122,11 @@ if (args[args.indexOf("--mode") + 1] === "rpc") {
 						? { id: command.id, type: "response", command: "get_state", success: false, error: "rejected" }
 						: { id: command.id, type: "response", command: "get_state", success: true, data: { sessionId: "fake-rpc-session" } });
 				} else if (command.type === "prompt") {
+					const promptDelay = Number(process.env.PRIME_AGENT_DELEGATE_FAKE_PROMPT_DELAY_MS);
+					if (Number.isFinite(promptDelay) && promptDelay > 0) {
+						const deadline = Date.now() + promptDelay;
+						while (Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(50, deadline - Date.now()));
+					}
 					const expected = process.env.PRIME_AGENT_DELEGATE_FAKE_EXPECT_PROMPT_SHA256;
 					const actual = createHash("sha256").update(command.message, "utf8").digest("hex");
 					if (expected && actual !== expected) {
@@ -137,6 +142,11 @@ if (args[args.indexOf("--mode") + 1] === "rpc") {
 					}
 					makeChange();
 					emit({ id: command.id, type: "response", command: "prompt", success: true });
+					if (scenario === "hang-after-prompt") {
+						// Emit one event so the delegate sees a live agent, then hang without changes.
+						emit({ type: "turn_start" });
+						Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 600000);
+					}
 					emitScenario({ includeSession: false });
 				}
 			}

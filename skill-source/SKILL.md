@@ -168,7 +168,7 @@ rendered artifacts, not delegation history.
 Each run retains:
 
 - `events.jsonl`, `stderr.log`, and `worker-prompt.md`;
-- `health.json`, `summary.json`, and `audit-summary.json` (enriched with tool call stats `totalToolCalls` and `failedToolCalls`);
+- `health.json`, `summary.json`, and `audit-summary.json` (enriched with tool call stats `totalToolCalls`, `failedToolCalls`, read/write split, and `toolCallsBeforeFirstEdit`);
 - `run-manifest.json`;
 - split `task-parts/` with a `taskSha256` integrity manifest for content above the
   inline threshold;
@@ -230,7 +230,7 @@ Defaults:
 | `--idle-timeout-ms` | 300000 |
 | `--max-infra-restarts` | 1 |
 | `--restart-delay-ms` | 5000 |
-| `--no-change-timeout-ms` | 600000 |
+| `--no-change-timeout-ms` | 600000 (RPC: starts at prompt acceptance; CLI: at the first valid event) |
 | `--no-change-max-tool-calls` | 80 |
 | `--repeated-tool-failure-limit` | 8 |
 | `--task-part-bytes` | 600 |

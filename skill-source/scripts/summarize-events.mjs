@@ -11,6 +11,33 @@ function fail(message) {
 	process.exit(2);
 }
 
+const WRITE_TOOLS = new Set([
+	"write",
+	"edit",
+	"multi_edit",
+	"apply_patch",
+	"str_replace_editor",
+	"str_replace_based_edit_tool",
+	"create_file",
+	"write_file",
+]);
+
+function classifyToolCall(toolName, args) {
+	const name = String(toolName || "").toLowerCase();
+	if (WRITE_TOOLS.has(name)) return "write";
+	const keys = args && typeof args === "object" ? Object.keys(args) : [];
+	if (keys.includes("edits") || keys.includes("new_string") || keys.includes("file_text")) return "write";
+	const pythonWrites = /open\([^)]*,\s*['"][wax][+bt]*['"]|write(FileSync|_text|_bytes)|\btee\b/i;
+	if (name === "ipython" && typeof args?.code === "string" && pythonWrites.test(args.code)) return "write";
+	if (name === "bash" && typeof args?.command === "string") {
+		const command = args.command.replace(/\b\d*>\s*\/dev\/null\b|\b\d*>&\d\b/g, "");
+		const writes = /(>>|[^|>]>[^>])\s*\S|\bsed\s+(-[^\n]*\s)?-i\b|\btee\b/i.test(command) || pythonWrites.test(command);
+		if (writes) return "write";
+		return "read";
+	}
+	return "read";
+}
+
 function parseArgs(argv) {
 	const options = {};
 	for (let i = 0; i < argv.length; i++) {
@@ -71,6 +98,13 @@ const models = {};
 const failures = [];
 const toolInvocations = [];
 const invocationCounts = new Map();
+let writeToolCalls = 0;
+let readToolCalls = 0;
+let editToolCalls = 0;
+let firstEditToolCallIndex = null;
+let firstEditToolName = null;
+let firstEditToolArgsPreview = null;
+let toolCallIndex = 0;
 let lineCount = 0;
 let parseErrors = 0;
 
@@ -90,8 +124,21 @@ for await (const line of lines) {
 		const tool = tools[event.toolName] ||= { started: 0, completed: 0, failed: 0 };
 		if (event.type === "tool_execution_start") {
 			tool.started++;
+			toolCallIndex++;
+			const classification = classifyToolCall(event.toolName, event.args);
+			if (classification === "write") {
+				writeToolCalls++;
+				if (event.toolName !== "ipython" && event.toolName !== "bash") editToolCalls++;
+				if (firstEditToolCallIndex === null) {
+					firstEditToolCallIndex = toolCallIndex;
+					firstEditToolName = event.toolName;
+					firstEditToolArgsPreview = compact(event.args, 300);
+				}
+			} else {
+				readToolCalls++;
+			}
 			const args = compact(event.args, 500);
-			pushLimited(toolInvocations, { tool: event.toolName, args });
+			pushLimited(toolInvocations, { tool: event.toolName, args, kind: classification });
 			const key = `${event.toolName}\0${args}`;
 			invocationCounts.set(key, (invocationCounts.get(key) || 0) + 1);
 		}
@@ -141,6 +188,13 @@ const audit = {
 		terminalAssistantMessagePresent: Boolean(run.finalText),
 		totalToolCalls,
 		failedToolCalls,
+		readToolCalls,
+		writeToolCalls,
+		editToolCalls,
+		toolCallsBeforeFirstEdit: firstEditToolCallIndex === null ? totalToolCalls : firstEditToolCallIndex - 1,
+		firstEditToolCallIndex,
+		firstEditToolName,
+		firstEditToolArgsPreview,
 		finalText: compact(run.finalText, 2000),
 	},
 	source: {
@@ -158,6 +212,7 @@ const audit = {
 	stderrTail: stderrTail(options.stderr),
 	reviewGuidance: [
 		"Review this file and summary.json first; do not load events.jsonl into model context by default.",
+		"Check run.toolCallsBeforeFirstEdit and run.writeToolCalls against the reading budget: pre-edit exploration should stay within the worker prompt rules.",
 		"Independently inspect git diff and rerun required acceptance checks.",
 		"Use targeted streaming filters on events.jsonl only when this summary shows a discrepancy.",
 	],

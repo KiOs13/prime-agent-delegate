@@ -123,8 +123,8 @@ function parseIntOption(value, name, { min = 1, max = Infinity } = {}) {
 }
 
 function runLocalSync(args) {
-	if (WSL_MODE) return spawnSync("bash", ["-lc", args.join(" ")], { encoding: "utf8" });
-	const result = spawnSync("wsl.exe", ["bash", "-lc", args.join(" ")], { encoding: null, windowsHide: true });
+	if (WSL_MODE) return spawnSync("bash", ["-lc", shellJoin(args)], { encoding: "utf8" });
+	const result = spawnSync("wsl.exe", ["bash", "-lc", shellJoin(args)], { encoding: null, windowsHide: true });
 	return { ...result, stdout: decodeCapturedOutput(result.stdout), stderr: decodeCapturedOutput(result.stderr) };
 }
 
@@ -156,11 +156,11 @@ function windowsPathToWslPath(value) {
 
 // --check: version plus daemon/status command reachability. No model inference.
 function checkInstallation() {
-	const versionResult = runLocalSync([shellJoin([...PRIME_AGENT_COMMAND, "--version"])]);
+	const versionResult = runLocalSync([...PRIME_AGENT_COMMAND, "--version"]);
 	const version = (versionResult.stdout.trim() || versionResult.stderr.trim()).split(/\r?\n/, 1)[0] ?? "";
 	const versionOk = versionResult.status === 0 && version.length > 0;
 
-	const statusResult = runLocalSync([shellJoin([...PRIME_AGENT_COMMAND, "status", "--json"])]);
+	const statusResult = runLocalSync([...PRIME_AGENT_COMMAND, "status", "--json"]);
 	let statusServices = null;
 	let statusOk = statusResult.status === 0;
 	try {
@@ -191,7 +191,7 @@ function checkInstallation() {
 }
 
 function readPrimeVersion() {
-	const result = runLocalSync([shellJoin([...PRIME_AGENT_COMMAND, "--version"])]);
+	const result = runLocalSync([...PRIME_AGENT_COMMAND, "--version"]);
 	const version = (result.stdout.trim() || result.stderr.trim()).split(/\r?\n/, 1)[0] ?? "";
 	if (result.status !== 0 || !version) fail("prime-agent --version failed");
 	return version;
@@ -737,6 +737,7 @@ let healthWriteTimer = null;
 let lastChildExitCode = null;
 let lastChildSignal = null;
 let forcedTerminalReason = null;
+let noChangeWindowStartedAt = null;
 let rpcStateId = null;
 let rpcPromptId = null;
 let repeatedToolFailure = { fingerprint: null, count: 0, toolName: null };
@@ -771,7 +772,9 @@ function processPrimeEvent(event, line = JSON.stringify(event)) {
 		for (const message of event.messages) finalText = assistantText(message) || finalText;
 	}
 	if (shouldPersistEvent(event)) {
-		events.write(`${line}\n`);
+		// Persist with a delegate-side capture timestamp; original event keys stay first.
+		const captured = { ...event, capturedAt: new Date().toISOString() };
+		events.write(`${JSON.stringify(captured)}\n`);
 		persistedEventCount++;
 	} else {
 		droppedStreamingEventCount++;
@@ -823,6 +826,7 @@ function processRpcResponse(response) {
 			return;
 		}
 		transport.promptAccepted = true;
+		armNoChangeTimer();
 	}
 }
 
@@ -853,6 +857,7 @@ function onValidEvent(event) {
 	if ([FAILURE_KIND.REPEATED_TOOL_FAILURE, FAILURE_KIND.MAX_TURNS_EXHAUSTED].includes(pendingCondition)) return;
 	const wasFirstEvent = !firstEventSeen;
 	firstEventSeen = true;
+	if (wasFirstEvent && requestedTransport !== "rpc") armNoChangeTimer();
 	const now = Date.now();
 	const toolCall = event?.type === "tool_execution_start";
 	const turnStart = event?.type === "turn_start";
@@ -878,10 +883,11 @@ function onValidEvent(event) {
 			health = updateHealth(health, { changeDetectedAt: new Date(now).toISOString(), lastReason: "change_detected", now });
 			clearTimeout(noChangeTimer);
 			noChangeTimer = null;
+			noChangeWindowStartedAt = null;
 		} else if (shouldStopForNoChange({
 			requireChange: true,
-			elapsedMs: now - Date.parse(health.attemptStartedAt),
-			timeoutMs: noChangeTimeoutMs,
+			elapsedMs: noChangeWindowStartedAt === null ? 0 : now - noChangeWindowStartedAt,
+			timeoutMs: noChangeWindowStartedAt === null ? Infinity : noChangeTimeoutMs,
 			toolCallCount: health.attemptToolCallCount,
 			maxToolCalls: noChangeMaxToolCalls,
 		})) {
@@ -962,6 +968,12 @@ function onIdleTimeout() {
 	terminateChild("idle_timeout");
 }
 
+function armNoChangeTimer() {
+	if (!options.requireChange || noChangeTimer) return;
+	noChangeWindowStartedAt = Date.now();
+	noChangeTimer = setTimeout(onNoChangeTimeout, noChangeTimeoutMs);
+}
+
 function onNoChangeTimeout() {
 	if (finalized || attemptClosed || !options.requireChange || health.changeDetectedAt) return;
 	const porcelain = currentGitPorcelain();
@@ -1011,6 +1023,7 @@ function spawnAttempt() {
 	rpcStateId = `delegate-state-${attempt}`;
 	rpcPromptId = `delegate-prompt-${attempt}`;
 	repeatedToolFailure = { fingerprint: null, count: 0, toolName: null };
+	noChangeWindowStartedAt = null;
 	transport.handshakeAccepted = requestedTransport === "rpc" ? false : null;
 	transport.promptAccepted = requestedTransport === "rpc" ? false : null;
 	stdoutBuffer = "";
@@ -1067,7 +1080,8 @@ function spawnAttempt() {
 	}
 
 	startupTimer = setTimeout(onStartupTimeout, startupGraceMs);
-	if (options.requireChange) noChangeTimer = setTimeout(onNoChangeTimeout, noChangeTimeoutMs);
+	// The no-change window starts only after the prompt is accepted, so slow
+	// startup/handshake never consumes the worker's no-change budget.
 	if (!overallTimer) overallTimer = setTimeout(onOverallTimeout, Math.max(0, overallDeadlineMs - Date.now()));
 	process.stdout.write(`${JSON.stringify({ type: "attempt_start", attempt, childPid: child.pid, startedAt: attemptStartedAt })}\n`);
 }
