@@ -3,7 +3,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { sanitize } from "./sanitize.mjs";
 import {
@@ -58,7 +58,11 @@ const DEFAULT_REPEATED_TOOL_FAILURE_LIMIT = 8;
 const DEFAULT_AUTONOMOUS_MAX_CONTINUATIONS = 3;
 const DEFAULT_AUTONOMOUS_MAX_TOKENS = 1000000;
 const INLINE_TASK_MAX_BYTES = 1024;
-const TASK_CHUNK_MAX_BYTES = 600;
+const DEFAULT_INLINE_TASK_MAX_BYTES = 1024;
+const DEFAULT_TASK_CHUNK_MAX_BYTES = 600;
+const STAGED_CONTEXT_MAX_FILES = 64;
+const STAGED_CONTEXT_MAX_TOTAL_BYTES = 1024 * 1024;
+const STAGED_CONTEXT_MAX_RANGE_BYTES = 256 * 1024;
 const TERMINATE_GRACE_MS = 2000;
 const HEALTH_WRITE_INTERVAL_MS = 1000;
 const STDERR_PREVIEW_MAX_BYTES = 4096;
@@ -70,9 +74,9 @@ function fail(message) {
 }
 
 function parseArgs(argv) {
-	const options = { check: false, noTools: false, autonomous: false, autonomousGates: [], allowedChanges: [], fullEvents: false, requireChange: false, wslMode: false, prepareCommand: false };
+	const options = { check: false, noTools: false, autonomous: false, autonomousGates: [], allowedChanges: [], stagedContext: [], fullEvents: false, requireChange: false, wslMode: false, prepareCommand: false };
 	const valueArgs = new Set([
-		"--cwd", "--prompt-file", "--out-dir", "--timeout-ms", "--provider", "--model", "--thinking",
+		"--cwd", "--prompt-file", "--out-dir", "--timeout-ms", "--provider", "--model", "--thinking", "--task-part-bytes", "--inline-task-bytes",
 		"--thread-id", "--run-id", "--project-id",
 		"--task-id", "--work-package-id", "--task-type", "--delegation-mode", "--transport",
 		"--autonomous-max-continuations", "--autonomous-max-turns", "--autonomous-max-tokens",
@@ -88,10 +92,15 @@ function parseArgs(argv) {
 		else if (arg === "--wsl-mode") options.wslMode = true;
 		else if (arg === "--prepare-command") options.prepareCommand = true;
 		else if (arg === "--autonomous") options.autonomous = true;
+		else if (arg === "--no-staged-context") options.noStagedContext = true;
 		else if (arg === "--allow-change") {
 			const value = argv[++i];
 			if (!value) fail("Missing value for --allow-change");
 			options.allowedChanges.push(value.replaceAll("\\", "/"));
+		} else if (arg === "--stage-context") {
+			const value = argv[++i];
+			if (!value) fail("Missing value for --stage-context");
+			options.stagedContext.push(value);
 		} else if (arg === "--autonomous-gate") {
 			const value = argv[++i];
 			if (!value) fail("Missing value for --autonomous-gate");
@@ -280,6 +289,47 @@ function ensureOutputIgnored({ cwd, wslCwd, outDir, gitContext }) {
 	if (result.status !== 0) fail(`Output path inside the worktree must be ignored by Git: ${relativeOut}`);
 }
 
+const STAGED_CONTEXT_RANGE = /@([1-9][0-9]*)-([1-9][0-9]*)$/;
+
+function stageContextFiles({ stagedSpecs, outDir }) {
+	if (stagedSpecs.length === 0) return null;
+	const contextDir = join(outDir, "context");
+	mkdirSync(contextDir, { recursive: true });
+	const entries = [];
+	for (const spec of stagedSpecs) {
+		const rangeMatch = spec.match(STAGED_CONTEXT_RANGE);
+		const sourcePath = rangeMatch ? spec.slice(0, rangeMatch.index) : spec;
+		const source = requireAbsoluteExistingPath(sourcePath, "--stage-context");
+		const range = rangeMatch ? { start: Number(rangeMatch[1]), end: Number(rangeMatch[2]) } : null;
+		if (range && range.start > range.end) fail(`--stage-context invalid line range: ${spec}`);
+		let content = readFileSync(source, "utf8");
+		if (range) {
+			const lines = content.split("\n");
+			if (range.end > lines.length) fail(`--stage-context range end ${range.end} exceeds ${sourcePath} (${lines.length} lines)`);
+			content = lines.slice(range.start - 1, range.end).join("\n");
+		}
+		if (Buffer.byteLength(content, "utf8") > STAGED_CONTEXT_MAX_RANGE_BYTES) fail(`--stage-context source exceeds ${STAGED_CONTEXT_MAX_RANGE_BYTES} bytes: ${spec}`);
+		const relativeSource = source.replace(/\\/g, "/");
+		const name = entries.some((entry) => entry.source === relativeSource)
+			? `${entries.filter((entry) => entry.source === relativeSource).length + 1}-${basename(source)}`
+			: basename(source);
+		if (entries.some((entry) => entry.name === name)) fail(`--stage-context duplicate file name: ${name}`);
+		writeFileSync(join(contextDir, name), content, "utf8");
+		entries.push({
+			source: relativeSource,
+			name,
+			lineRange: range ? `${range.start}-${range.end}` : null,
+			bytes: Buffer.byteLength(content, "utf8"),
+			sha256: createHash("sha256").update(content, "utf8").digest("hex"),
+		});
+	}
+	if (entries.length > STAGED_CONTEXT_MAX_FILES) fail(`--stage-context exceeds ${STAGED_CONTEXT_MAX_FILES} files`);
+	const totalBytes = entries.reduce((sum, entry) => sum + entry.bytes, 0);
+	if (totalBytes > STAGED_CONTEXT_MAX_TOTAL_BYTES) fail(`--stage-context exceeds ${STAGED_CONTEXT_MAX_TOTAL_BYTES} total bytes`);
+	writeFileSync(join(contextDir, "manifest.json"), `${JSON.stringify({ schemaVersion: 1, entries }, null, 2)}\n`, "utf8");
+	return { contextDir, wslContextDir: toWslPath(contextDir), entries, totalBytes };
+}
+
 function artifactEntries(runDir, manifestPath) {
 	const entries = [];
 	const visit = (directory) => {
@@ -372,6 +422,19 @@ if ((options.requireChange || options.allowedChanges.length > 0) && !options.aut
 if (options.autonomous && options.autonomousGates.length === 0) {
 	fail("--autonomous requires at least one explicit --autonomous-gate");
 }
+if (options.noTools && options.noStagedContext) {
+	fail("--no-staged-context is only valid with file tools enabled");
+}
+const taskChunkMaxBytes = parseIntOption(
+	options.taskPartBytes ?? DEFAULT_TASK_CHUNK_MAX_BYTES,
+	"--task-part-bytes",
+	{ min: 200, max: 8192 },
+);
+const inlineTaskBytes = parseIntOption(
+	options.inlineTaskBytes ?? DEFAULT_INLINE_TASK_MAX_BYTES,
+	"--inline-task-bytes",
+	{ min: 200, max: 8192 },
+);
 const requestedTransport = options.transport ?? "rpc";
 if (!["rpc", "cli"].includes(requestedTransport)) fail("--transport must be rpc or cli");
 let runMetadata;
@@ -404,6 +467,10 @@ if (options.prepareCommand) {
 	if (options.noChangeTimeoutMs) parts.push("--no-change-timeout-ms", options.noChangeTimeoutMs);
 	if (options.noChangeMaxToolCalls) parts.push("--no-change-max-tool-calls", options.noChangeMaxToolCalls);
 	if (options.repeatedToolFailureLimit) parts.push("--repeated-tool-failure-limit", options.repeatedToolFailureLimit);
+	if (options.taskPartBytes) parts.push("--task-part-bytes", options.taskPartBytes);
+	if (options.inlineTaskBytes) parts.push("--inline-task-bytes", options.inlineTaskBytes);
+	for (const spec of options.stagedContext) parts.push("--stage-context", windowsPathToWslPath(spec));
+	if (options.noStagedContext) parts.push("--no-staged-context");
 	if (options.provider) parts.push("--provider", options.provider);
 	if (options.model) parts.push("--model", options.model);
 	if (options.thinking) parts.push("--thinking", options.thinking);
@@ -456,24 +523,30 @@ const autonomousMaxTokens = parseIntOption(options.autonomousMaxTokens ?? DEFAUL
 const prompt = readFileSync(promptFile, "utf8").trim();
 if (!prompt) fail("--prompt-file is empty");
 
-const workerRules = [
+const readBatchingRules = options.noTools
+	? []
+	: [
+		"Batch reads in one tool call with a heredoc-free shell command per batch, for example:",
+		`sed -n '1,200p' file1.md && sed -n '300,420p' src/code.php && grep -n 'keyword' src/other.php`,
+	];
+const workerRulesBase = [
 	"You are a delegated coding worker. Work only in cwd.",
 	"Do not commit, push, deploy, alter credentials, or perform destructive cleanup.",
 	"For split tasks, read the manifest and every ordered part in one tool call, then stitch all parts into the full prompt.",
 	"Use targeted reads and batch independent reads in one tool call. Do not open worker-prompt.md; it is only an audit artifact.",
 	"Once a target range is found, do not reread overlapping ranges unless earlier output was missing.",
-	...options.noTools ? [] : ["Reading budget: finish all exploration in at most 4 tool calls, keep every read batched, and never reread a file. Every tool call after the 4th must follow the first allowed edit."],
+...readBatchingRules,
+	"Reading budget: finish all exploration in at most 4 tool calls, keep every read batched, and never reread a file. Every tool call after the 4th must follow the first allowed edit.",
 	"Run only focused checks for the bounded change. Leave full integration and regression suites to Codex after this worker session exits.",
 	options.requireChange
 		? `The no-change watchdog kills this process after ${noChangeTimeoutMs} ms or ${noChangeMaxToolCalls} tool calls without a file change. Make the first allowed edit within the first 4 tool calls, before writing assertions.`
 		: "Do not edit unless the task explicitly requests it.",
 	options.autonomous ? "The host runs final gates. Return changed files, checks, and blockers." : "Return one concise final report.",
 ];
-const auditTaskContract = [...workerRules, "", "TASK:", prompt].join("\n");
+const auditTaskContractBase = [...workerRulesBase, "", "TASK:", prompt].join("\n");
 const taskBytes = Buffer.byteLength(prompt, "utf8");
-const effectiveTaskContractBytes = Buffer.byteLength(auditTaskContract, "utf8");
-if (options.noTools && effectiveTaskContractBytes > INLINE_TASK_MAX_BYTES) {
-	fail(`--no-tools effective payload exceeds ${INLINE_TASK_MAX_BYTES} UTF-8 bytes`);
+if (options.noTools && Buffer.byteLength(auditTaskContractBase, "utf8") > inlineTaskBytes) {
+	fail(`--no-tools effective payload exceeds ${inlineTaskBytes} UTF-8 bytes`);
 }
 
 const runId = options.runId ?? randomUUID();
@@ -482,6 +555,21 @@ const gitContext = resolveWslGitContext(cwd, wslCwd);
 const outDir = resolve(options.outDir ?? join(cwd, ".prime-delegate", "runs", runId));
 ensureOutputIgnored({ cwd, wslCwd, outDir, gitContext });
 mkdirSync(outDir, { recursive: true });
+
+let stagedContext = null;
+if (!options.noStagedContext && !options.noTools) {
+	stagedContext = stageContextFiles({ stagedSpecs: options.stagedContext, outDir });
+}
+const wslStagedContextDir = stagedContext ? stagedContext.wslContextDir : null;
+const stagedContextRule = wslStagedContextDir
+	? `All task context is pre-staged under ${wslStagedContextDir} (see context/manifest.json for exact sources). Batch-read every file there in one tool call before anything else, and rely on it instead of reading those sources from the worktree.`
+	: null;
+const workerRules = [...workerRulesBase];
+if (stagedContextRule) {
+	workerRules.splice(workerRules.indexOf("Once a target range is found, do not reread overlapping ranges unless earlier output was missing.") + 1, 0, stagedContextRule);
+}
+const auditTaskContract = [...workerRules, "", "TASK:", prompt].join("\n");
+const effectiveTaskContractBytes = Buffer.byteLength(auditTaskContract, "utf8");
 
 const eventsPath = join(outDir, "events.jsonl");
 const stderrPath = join(outDir, "stderr.log");
@@ -501,16 +589,17 @@ const primeVersion = readPrimeVersion();
 writeFileSync(workerPromptPath, `${auditTaskContract}\n`, "utf8");
 
 let primeTask = auditTaskContract;
+const taskSha256 = createHash("sha256").update(prompt, "utf8").digest("hex");
 let taskPartCount = 0;
 let maxTaskPartBytes = 0;
 let transportMode;
-if (options.noTools) {
+if (options.noTools || taskBytes <= inlineTaskBytes) {
 	transportMode = "inline";
 } else {
 	transportMode = "task-parts";
 	const taskPartsDir = join(outDir, "task-parts");
 	mkdirSync(taskPartsDir, { recursive: true });
-	const taskParts = splitUtf8ByBytes(prompt, TASK_CHUNK_MAX_BYTES).map((content, index) => {
+	const taskParts = splitUtf8ByBytes(prompt, taskChunkMaxBytes).map((content, index) => {
 		const name = `part-${String(index + 1).padStart(3, "0")}.txt`;
 		const bytes = Buffer.byteLength(content, "utf8");
 		writeFileSync(join(taskPartsDir, name), content, "utf8");
@@ -519,13 +608,14 @@ if (options.noTools) {
 	taskPartCount = taskParts.length;
 	maxTaskPartBytes = Math.max(...taskParts.map((part) => part.bytes), 0);
 	const taskManifestPath = join(taskPartsDir, "manifest.json");
-	writeFileSync(taskManifestPath, `${JSON.stringify({ schemaVersion: 1, taskBytes, maxPartBytes: TASK_CHUNK_MAX_BYTES, parts: taskParts }, null, 2)}\n`, "utf8");
+	writeFileSync(taskManifestPath, `${JSON.stringify({ schemaVersion: 1, taskBytes, taskSha256, maxPartBytes: taskChunkMaxBytes, parts: taskParts }, null, 2)}\n`, "utf8");
 	const wslTaskPartsDir = toWslPath(taskPartsDir);
 	primeTask = [
 		`TASK MANIFEST: ${wslTaskPartsDir}/manifest.json`,
 		`TASK PARTS: ${taskParts.map((part) => `${wslTaskPartsDir}/${part.name}`).join(" ")}`,
 		"Read the manifest and every exact TASK PARTS path once in order in one tool call.",
-		"After reading all parts, stitch them together into the complete task prompt and implement immediately.",
+		"Verify the stitched task: `cat <every TASK PARTS path in order> | sha256sum` must equal the manifest taskSha256. If it differs, stop without editing and report a task_integrity_mismatch in the final report.",
+		"After a matching checksum, implement immediately.",
 		"",
 		...workerRules,
 	].join("\n");
@@ -542,7 +632,8 @@ const transport = {
 	handshakeAccepted: requestedTransport === "rpc" ? false : null,
 	promptAccepted: requestedTransport === "rpc" ? false : null,
 	inlineByteLimit: INLINE_TASK_MAX_BYTES,
-	partByteLimit: TASK_CHUNK_MAX_BYTES,
+	partByteLimit: taskChunkMaxBytes,
+	taskSha256,
 	partCount: taskPartCount,
 	maxPartBytes: maxTaskPartBytes,
 };
@@ -602,6 +693,7 @@ let health = createHealth({
 	noChangeTimeoutMs,
 	noChangeMaxToolCalls,
 	repeatedToolFailureLimit,
+	stagedContextRule,
 	restartDelayMs,
 	overallTimeoutMs: timeoutMs,
 	maxInfraRestarts,
@@ -1247,10 +1339,6 @@ function finalize(status, reason, decisionReason, worktreeDiff) {
 		terminalReason: reason,
 		taskId: runMetadata?.taskId ?? null,
 	};
-	try {
-		writeFileSync(join(cwd, ".prime-task-complete.json"), JSON.stringify(taskCompleteMarker, null, 2) + "\n", "utf8");
-	} catch {}
-
 	const finishedAt = new Date().toISOString();
 	taskCompleteMarker.finishedAt = finishedAt;
 	try {
@@ -1280,6 +1368,15 @@ function finalize(status, reason, decisionReason, worktreeDiff) {
 		noChangeTimeoutMs,
 		noChangeMaxToolCalls,
 		repeatedToolFailureLimit,
+		taskChunkMaxBytes,
+		stagedContext: stagedContext
+			? {
+				dir: stagedContext.contextDir,
+				wslDir: stagedContext.wslContextDir,
+				entryCount: stagedContext.entries.length,
+				totalBytes: stagedContext.totalBytes,
+			}
+			: null,
 		repeatedToolFailureCount: health.repeatedToolFailureCount,
 		repeatedToolFailureTool: health.repeatedToolFailureTool,
 		observedTurnCount: health.attemptTurnCount,
@@ -1312,7 +1409,7 @@ function finalize(status, reason, decisionReason, worktreeDiff) {
 		finalText,
 		worktreeDiff,
 		healthPath,
-		artifacts: { eventsPath, stderrPath, summaryPath, auditSummaryPath, workerPromptPath, healthPath, runManifestPath },
+		artifacts: { eventsPath, stderrPath, summaryPath, auditSummaryPath, workerPromptPath, healthPath, runManifestPath, ...(stagedContext ? { stagedContextManifestPath: join(stagedContext.contextDir, "manifest.json") } : {}) },
 	};
 	writeFileSync(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
 	let pendingStreams = 2;

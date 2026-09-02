@@ -33,3 +33,29 @@ test("redacts authorization and key-value secrets inside strings", () => {
 	assert.match(sanitized, /safe=value/);
 	assert.equal(sanitizeString("authorization=plain-secret"), "authorization=[REDACTED]");
 });
+
+test("redacts structured key material and opaque credential formats", () => {
+	const keys = ["id_token", "client_secret", "private_key"];
+	for (const key of keys) assert.equal(isSecretKey(key), true, key);
+
+	const sanitized = sanitizeString(
+		"id_token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9P" +
+			" client_secret: cs-live-9f8e7d6c" +
+			" private_key=MIIEpAIBAAKCAQEA" +
+			" aws=AKIAIOSFODNN7EXAMPLE",
+	);
+	for (const fragment of ["eyJhbGciOiJIUzI1NiJ9", "cs-live-9f8e7d6c", "MIIEpAIBAAKCAQEA", "AKIAIOSFODNN7EXAMPLE"]) {
+		assert.equal(sanitized.includes(fragment), false, fragment);
+	}
+	assert.match(sanitized, /id_token=\[REDACTED\]/);
+	assert.match(sanitized, /client_secret: \[REDACTED\]/);
+	assert.match(sanitized, /private_key=\[REDACTED\]/);
+	assert.match(sanitized, /aws=\[REDACTED\]/);
+
+	assert.equal(
+		sanitizeString("-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAK\n-----END RSA PRIVATE KEY-----"),
+		"[REDACTED]",
+	);
+	const structured = sanitize({ client_secret: "s", private_key: "p", id_token: "t", safe: "ok" });
+	assert.deepEqual(structured, { client_secret: "[REDACTED]", private_key: "[REDACTED]", id_token: "[REDACTED]", safe: "ok" });
+});

@@ -124,9 +124,6 @@ if (args[args.indexOf("--mode") + 1] === "rpc") {
 				} else if (command.type === "prompt") {
 					const expected = process.env.PRIME_AGENT_DELEGATE_FAKE_EXPECT_PROMPT_SHA256;
 					const actual = createHash("sha256").update(command.message, "utf8").digest("hex");
-					if (process.env.PRIME_AGENT_DELEGATE_FAKE_PROMPT_ECHO) {
-						writeFileSync(process.env.PRIME_AGENT_DELEGATE_FAKE_PROMPT_ECHO, command.message, "utf8");
-					}
 					if (expected && actual !== expected) {
 						emit({ id: command.id, type: "response", command: "prompt", success: false, error: `prompt sha mismatch: ${actual}` });
 						continue;
@@ -134,6 +131,9 @@ if (args[args.indexOf("--mode") + 1] === "rpc") {
 					if (scenario === "rpc-reject-prompt") {
 						emit({ id: command.id, type: "response", command: "prompt", success: false, error: "rejected" });
 						continue;
+					}
+					if (process.env.PRIME_AGENT_DELEGATE_FAKE_PROMPT_ECHO) {
+						writeFileSync(process.env.PRIME_AGENT_DELEGATE_FAKE_PROMPT_ECHO, command.message, "utf8");
 					}
 					makeChange();
 					emit({ id: command.id, type: "response", command: "prompt", success: true });

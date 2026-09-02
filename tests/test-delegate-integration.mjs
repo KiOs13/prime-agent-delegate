@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -86,7 +86,14 @@ test("default RPC uses task-parts for large prompts and seals artifacts", () => 
 		readFileSync(join(outDir, "worker-prompt.md"), "utf8"),
 		/Reading budget: finish all exploration in at most 4 tool calls/,
 	);
-	assert.match(readFileSync(join(outDir, "worker-prompt.md"), "utf8"), /Do not edit unless the task explicitly requests it\./);
+	assert.match(
+		readFileSync(join(outDir, "worker-prompt.md"), "utf8"),
+		/Batch reads in one tool call with a heredoc-free shell command per batch/,
+	);
+	assert.match(
+		readFileSync(join(outDir, "worker-prompt.md"), "utf8"),
+		/Do not edit unless the task explicitly requests it\./,
+	);
 	const taskManifest = json(join(outDir, "task-parts", "manifest.json"));
 	assert.equal(taskManifest.parts.map((part) => readFileSync(join(outDir, "task-parts", part.name), "utf8")).join(""), prompt);
 	for (const part of taskManifest.parts) assert.equal(sha256(join(outDir, "task-parts", part.name)), part.sha256);
@@ -112,24 +119,28 @@ test("default RPC uses task-parts for large prompts and seals artifacts", () => 
 	}
 });
 
-test("short tools-enabled RPC uses task-parts and preserves exact Unicode", () => {
+test("short tools-enabled RPC ships the task inline and preserves exact Unicode", () => {
 	const cwd = createRepo();
-	const outDir = join(cwd, ".prime-delegate", "runs", "rpc-parts");
+	const outDir = join(cwd, ".prime-delegate", "runs", "rpc-inline");
 	const prompt = "Проверка 世界 😀 \u2028\u2029";
-	const promptEcho = join(outDir, "received-prompt.txt");
-	const result = runDelegate({ cwd, outDir, prompt, env: { PRIME_AGENT_DELEGATE_FAKE_PROMPT_ECHO: promptEcho } });
+	const result = runDelegate({
+		cwd,
+		outDir,
+		prompt,
+		env: { PRIME_AGENT_DELEGATE_FAKE_PROMPT_ECHO: join(outDir, "echoed-prompt.json") },
+	});
 	assert.equal(result.status, 0, result.stderr);
 	const summary = json(join(outDir, "summary.json"));
 	assert.equal(summary.transport.protocol, "rpc");
-	assert.equal(summary.transport.mode, "task-parts");
-	const taskManifest = json(join(outDir, "task-parts", "manifest.json"));
-	assert.equal(taskManifest.parts.map((part) => readFileSync(join(outDir, "task-parts", part.name), "utf8")).join(""), prompt.trim());
-	assert.equal(taskManifest.taskBytes, Buffer.byteLength(prompt.trim(), "utf8"));
-	assert.ok(taskManifest.parts.length >= 1);
-	const rpcPrompt = readFileSync(promptEcho, "utf8");
-	assert.match(rpcPrompt, /^TASK MANIFEST: \/.*\nTASK PARTS: \//);
-	for (const part of taskManifest.parts) assert.ok(rpcPrompt.includes(join(outDir, "task-parts", part.name).replaceAll("\\", "/")), part.name);
-	assert.match(rpcPrompt, /Read the manifest and every exact TASK PARTS path once in order in one tool call\./);
+	assert.equal(summary.transport.mode, "inline");
+	assert.equal(summary.transport.taskSha256, createHash("sha256").update(prompt.trim(), "utf8").digest("hex"));
+	assert.equal(existsSync(join(outDir, "task-parts")), false);
+
+	const rpcPrompt = readFileSync(join(outDir, "echoed-prompt.json"), "utf8");
+	assert.ok(rpcPrompt.includes("Проверка 世界 😀"), "unicode task text reaches the wire prompt");
+	assert.ok(rpcPrompt.includes(prompt.trim()), "full trimmed task text reaches the wire prompt");
+	assert.match(rpcPrompt, /TASK:/);
+	assert.doesNotMatch(rpcPrompt, /TASK PARTS: /);
 });
 
 test("no-tools remains inline-only across transports", () => {
@@ -157,18 +168,28 @@ test("no-tools remains inline-only across transports", () => {
 	assert.equal(existsSync(oversizedOut), false);
 });
 
-test("explicit CLI transport retains task-parts", () => {
+test("explicit CLI transport selects inline for short tasks and task-parts above the floor", () => {
 	const cwd = createRepo();
-	const outDir = join(cwd, ".prime-delegate", "runs", "cli-parts");
-	const prompt = "short CLI task";
-	const result = runDelegate({ cwd, outDir, prompt, args: ["--transport", "cli"] });
+	const inlineOut = join(cwd, ".prime-delegate", "runs", "cli-inline");
+	const shortPrompt = "short CLI task";
+	const inlineResult = runDelegate({ cwd, outDir: inlineOut, prompt: shortPrompt, args: ["--transport", "cli"] });
+	assert.equal(inlineResult.status, 0, inlineResult.stderr);
+	const inlineSummary = json(join(inlineOut, "summary.json"));
+	assert.equal(inlineSummary.transport.protocol, "cli");
+	assert.equal(inlineSummary.transport.mode, "inline");
+	assert.equal(existsSync(join(inlineOut, "task-parts")), false);
+
+	const partsOut = join(cwd, ".prime-delegate", "runs", "cli-parts");
+	const partsPrompt = "p".repeat(400);
+	const result = runDelegate({ cwd, outDir: partsOut, prompt: partsPrompt, args: ["--transport", "cli", "--inline-task-bytes", "200"] });
 	assert.equal(result.status, 0, result.stderr);
-	const summary = json(join(outDir, "summary.json"));
+	const summary = json(join(partsOut, "summary.json"));
 	assert.equal(summary.transport.mode, "task-parts");
-	assert.equal(summary.transport.protocol, "cli");
-	const taskManifest = json(join(outDir, "task-parts", "manifest.json"));
-	assert.equal(taskManifest.parts.map((part) => readFileSync(join(outDir, "task-parts", part.name), "utf8")).join(""), prompt);
-	for (const part of taskManifest.parts) assert.equal(sha256(join(outDir, "task-parts", part.name)), part.sha256);
+	const taskManifest = json(join(partsOut, "task-parts", "manifest.json"));
+	assert.equal(taskManifest.parts.map((part) => readFileSync(join(partsOut, "task-parts", part.name), "utf8")).join(""), partsPrompt);
+	assert.equal(taskManifest.taskSha256, summary.transport.taskSha256);
+	assert.equal(taskManifest.taskSha256, createHash("sha256").update(partsPrompt, "utf8").digest("hex"));
+	for (const part of taskManifest.parts) assert.equal(sha256(join(partsOut, "task-parts", part.name)), part.sha256);
 });
 
 test("--require-change fails closed when Prime exits zero without an edit", () => {
@@ -188,7 +209,10 @@ test("--require-change fails closed when Prime exits zero without an edit", () =
 		],
 	});
 	assert.equal(result.status, 1, result.stderr);
-	assert.match(readFileSync(join(outDir, "worker-prompt.md"), "utf8"), /Make the first allowed edit within the first 4 tool calls, before writing assertions\./);
+	assert.match(
+		readFileSync(join(outDir, "worker-prompt.md"), "utf8"),
+		/Make the first allowed edit within the first 4 tool calls, before writing assertions\./,
+	);
 	const summary = json(join(outDir, "summary.json"));
 	assert.equal(summary.terminalReason, "required_change_missing");
 	assert.equal(summary.failureClass, "contract");
@@ -241,6 +265,22 @@ test("--prepare-command forwards transport and repeated failure limit", () => {
 	assert.equal(result.status, 0, result.stderr);
 	assert.match(result.stdout, /'--transport' 'cli'/);
 	assert.match(result.stdout, /'--repeated-tool-failure-limit' '5'/);
+
+	const enriched = runDelegate({
+		cwd,
+		outDir,
+		prompt: "prepare staged",
+		args: [
+			"--prepare-command",
+			"--task-part-bytes", "1200",
+			"--stage-context", "C:\\ctx\\spec.md",
+			"--stage-context", "C:\\ctx\\guard.php@10-20",
+		],
+	});
+	assert.equal(enriched.status, 0, enriched.stderr);
+	assert.match(enriched.stdout, /'--task-part-bytes' '1200'/);
+	assert.match(enriched.stdout, /'--stage-context' '\/mnt\/c\/ctx\/spec\.md'/);
+	assert.match(enriched.stdout, /'--stage-context' '\/mnt\/c\/ctx\/guard\.php@10-20'/);
 });
 
 test("--prepare-command defaults out-dir to Codex home with run id", () => {
@@ -525,4 +565,121 @@ test("production ignores a fake executable unless test mode is enabled", () => {
 	const report = JSON.parse(check.stdout);
 	assert.equal(report.executable, "/usr/bin/prime-agent");
 	assert.notEqual(report.version, "prime-agent 0.8.0-test");
+});
+
+test("staged context is sealed with manifest and referenced by worker rules", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "staged-context");
+	const contextDir = join(mkdtempSync(join(tmpdir(), "prime-delegate-ctx-")), "src");
+	mkdirSync(contextDir, { recursive: true });
+	const specSource = join(contextDir, "spec.md");
+	writeFileSync(specSource, Array.from({ length: 120 }, (_, i) => `line ${i + 1}`).join("\n"), "utf8");
+	const rangeSource = join(contextDir, "guard.php");
+	writeFileSync(rangeSource, Array.from({ length: 400 }, (_, i) => `// php line ${i + 1}`).join("\n"), "utf8");
+	const echoPath = join(outDir, "echoed-prompt.json");
+	const result = runDelegate({
+		cwd,
+		outDir,
+		prompt: "staged context task",
+		env: {
+			PRIME_AGENT_DELEGATE_FAKE_PROMPT_ECHO: echoPath,
+			PRIME_AGENT_DELEGATE_FAKE_PROMPT_ECHO_APPEND: "1",
+		},
+		args: [
+			"--stage-context", specSource,
+			"--stage-context", `${rangeSource}@100-110`,
+		],
+	});
+	assert.equal(result.status, 0, result.stderr);
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.stagedContext.entryCount, 2);
+	assert.ok(summary.stagedContext.totalBytes > 0);
+
+	const contextManifest = json(join(outDir, "context", "manifest.json"));
+	assert.equal(contextManifest.schemaVersion, 1);
+	assert.equal(contextManifest.entries.length, 2);
+	const [specEntry, guardEntry] = contextManifest.entries;
+	assert.equal(specEntry.name, "spec.md");
+	assert.equal(specEntry.source.replaceAll("\\", "/").endsWith("/spec.md"), true);
+	assert.equal(specEntry.lineRange, null);
+	assert.equal(guardEntry.name, "guard.php");
+	assert.equal(guardEntry.lineRange, "100-110");
+	for (const entry of contextManifest.entries) {
+		const path = join(outDir, "context", entry.name);
+		assert.equal(createHash("sha256").update(readFileSync(path)).digest("hex"), entry.sha256, entry.name);
+	}
+	const stagedSpec = readFileSync(join(outDir, "context", "spec.md"), "utf8");
+	assert.match(stagedSpec, /^line 1$/m);
+	assert.match(stagedSpec, /^line 120$/m);
+	const stagedRange = readFileSync(join(outDir, "context", "guard.php"), "utf8");
+	assert.equal(
+		stagedRange,
+		Array.from({ length: 11 }, (_, i) => `// php line ${100 + i}`).join("\n"),
+	);
+
+	const rpcPrompt = readFileSync(echoPath, "utf8");
+	assert.match(rpcPrompt, /All task context is pre-staged under \/tmp\/\S+\/context/);
+	assert.match(rpcPrompt, /Batch-read every file there in one tool call before anything else/);
+});
+
+test("staged context is opt-out via --no-staged-context and fails closed on missing sources", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "staged-optout");
+	const missing = join(mkdtempSync(join(tmpdir(), "prime-delegate-ctx-")), "absent.md");
+	const result = runDelegate({ cwd, outDir, prompt: "opt", args: ["--stage-context", missing] });
+	assert.equal(result.status, 2);
+	assert.match(result.stderr, /--stage-context/);
+
+	const optOutDir = join(cwd, ".prime-delegate", "runs", "staged-optout-run");
+	const existing = join(mkdtempSync(join(tmpdir(), "prime-delegate-ctx-")), "note.md");
+	writeFileSync(existing, "context body", "utf8");
+	const ok = runDelegate({ cwd, outDir: optOutDir, prompt: "opt out", args: ["--stage-context", existing, "--no-staged-context"] });
+	assert.equal(ok.status, 0, ok.stderr);
+	assert.equal(json(join(optOutDir, "summary.json")).stagedContext, null);
+	assert.equal(existsSync(join(optOutDir, "context")), false);
+});
+
+test("--task-part-bytes raises the per-part budget and is validated", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "big-parts");
+	const prompt = "x".repeat(1500);
+	const result = runDelegate({ cwd, outDir, prompt, args: ["--task-part-bytes", "2048"] });
+	assert.equal(result.status, 0, result.stderr);
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.transport.partByteLimit, 2048);
+	const taskManifest = json(join(outDir, "task-parts", "manifest.json"));
+	assert.equal(taskManifest.maxPartBytes, 2048);
+	assert.equal(taskManifest.parts.length, 1);
+	assert.equal(taskManifest.parts[0].bytes, 1500);
+
+	const badDir = join(cwd, ".prime-delegate", "runs", "bad-parts");
+	const bad = runDelegate({ cwd, outDir: badDir, prompt: "tiny", args: ["--task-part-bytes", "100"] });
+	assert.equal(bad.status, 2);
+	assert.match(bad.stderr, /--task-part-bytes/);
+	assert.equal(existsSync(badDir), false);
+});
+
+test("inline threshold boundary and integrity manifest", () => {
+	const cwd = createRepo();
+	const atLimit = "b".repeat(1024);
+	const outAt = join(cwd, ".prime-delegate", "runs", "inline-at-limit");
+	const r1 = runDelegate({ cwd, outDir: outAt, prompt: atLimit });
+	assert.equal(r1.status, 0, r1.stderr);
+	assert.equal(json(join(outAt, "summary.json")).transport.mode, "inline");
+
+	const outAbove = join(cwd, ".prime-delegate", "runs", "inline-above");
+	const r2 = runDelegate({
+		cwd,
+		outDir: outAbove,
+		prompt: "b".repeat(1025),
+		env: { PRIME_AGENT_DELEGATE_FAKE_PROMPT_ECHO: join(outAbove, "echoed-prompt.json") },
+	});
+	assert.equal(r2.status, 0, r2.stderr);
+	const above = json(join(outAbove, "summary.json"));
+	assert.equal(above.transport.mode, "task-parts");
+	assert.equal(above.transport.taskSha256, createHash("sha256").update("b".repeat(1025), "utf8").digest("hex"));
+
+	const wirePrompt = readFileSync(join(outAbove, "echoed-prompt.json"), "utf8");
+	assert.match(wirePrompt, /Verify the stitched task: `cat <every TASK PARTS path in order> \| sha256sum` must equal the manifest taskSha256/);
+	assert.match(wirePrompt, /task_integrity_mismatch/);
 });

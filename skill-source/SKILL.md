@@ -26,25 +26,26 @@ Statistics may improve task packaging but never disable delegation.
 ## Workflow
 
 1. Inspect repository rules, Git state, and required checks.
-2. Run the installation check:
+2. Stage task context (see "Task context" below): exact guard strings, excerpts, or a
+   recon list of the files the worker must read. Write the task so the first edits do not
+   depend on broad exploration.
+3. Run the installation check:
 
 ```powershell
 node <skill-dir>\scripts\delegate.mjs --check
 ```
 
-3. Write a self-contained task with scope, constraints, gates, and:
-   `Do not commit. Work only inside the supplied cwd.` Include exact target
-   anchors and name the first expected edit so Prime does not need broad
-   reconnaissance before changing a file.
-4. For edits, create a separate `codex/prime-agent-<slug>` worktree under
+4. Write a self-contained task with scope, constraints, gates, and:
+   `Do not commit. Work only inside the supplied cwd.`
+5. For edits, create a separate `codex/prime-agent-<slug>` worktree under
    `C:\Project-Prime\worktrees\<project>\<slug>`, where `<project>` is the
    repository directory name. Never let Prime and Codex edit the same
    worktree concurrently.
-5. Keep the task file outside the delegated worktree, under
+6. Keep the task file outside the delegated worktree, under
    `C:\Project-Prime\runs\<project>\` next to that project's run folders
    (for example `C:\Project-Prime\runs\Prime-agent-delegate\smoke-task.md`),
    or under ignored `.codex/` in the repository.
-6. Generate the WSL command:
+7. Generate the WSL command:
 
 ```powershell
 node <skill-dir>\scripts\delegate.mjs --prepare-command `
@@ -62,14 +63,46 @@ Pass `--project-id <id>` to group runs by repository directory name and
 the `default` segment. An explicit `--out-dir` on `--prepare-command` still
 overrides this location.
 
-7. Run the emitted command with `wsl bash -lc`.
-8. Read `summary.json` and `audit-summary.json` first. Query `events.jsonl` only
+8. Run the emitted command with `wsl bash -lc`.
+9. Read `summary.json` and `audit-summary.json` first. Query `events.jsonl` only
    with targeted filters when compact evidence is insufficient.
-9. Prime may run focused checks for its bounded change, but must leave the full
+10. Prime may run focused checks for its bounded change, but must leave the full
    integration and regression suites to Codex after the worker session exits.
-10. Inspect the complete diff and rerun every acceptance check independently.
-11. Accept, fix, partially reuse, or reject the result. Commit only after Codex
+11. Inspect the complete diff and rerun every acceptance check independently.
+12. Accept, fix, partially reuse, or reject the result. Commit only after Codex
     verification and user authorization.
+
+## Task context
+
+Every unknown the worker must resolve by reading the repository costs model turns.
+Move host knowledge into the task before delegating:
+
+- Put exact strings the worker must assert or reproduce (guard lines, identifiers,
+  current wording) directly into the task file.
+- List the allowed files with a one-line reason each, and order the steps so cheap
+  document edits land before source-dependent assertions.
+- For repeated task families, keep a recon script next to the task file that prints
+  the needed excerpts in one deterministic command, and name it as the expected first
+  tool call.
+
+For runs that need sealed, auditable context, pass repeatable `--stage-context
+<windows-path>[@<start>-<end>]` flags. The launcher copies each source into
+`<run-dir>/context/`, records a sha256 manifest, and instructs the worker to batch-read
+that directory first and treat it as the authoritative view of those sources. Use
+`--no-staged-context` to opt out for a single run. Staged context is an audit snapshot,
+not live repository state: generate it from a fresh worktree immediately before launch.
+
+Task delivery is selected automatically: tasks whose text is at most
+`--inline-task-bytes <N>` UTF-8 bytes (default 1024, range 200-8192) ship inline in
+the wire prompt; anything larger goes through task parts. Raise
+`--task-part-bytes <N>` (default 600, range 200-8192) only after one verified live
+run on the target configuration, and confirm the checksum gate below passed.
+
+Integrity gate for split delivery: the parts manifest records `taskSha256` of the
+full task, and the worker instruction requires `cat <parts in order> | sha256sum` to
+match it before any edit; a mismatch must be reported as `task_integrity_mismatch`
+without changing files. `summary.transport.taskSha256` records the expected digest
+for run audits.
 
 ## Modes
 
@@ -97,11 +130,13 @@ sends one prompt command, and closes stdin. Use `--transport cli` only as a
 compatibility fallback.
 
 Prime's downstream CCR can replace user messages even when RPC delivery is
-byte-perfect. Tools-enabled runs therefore always store the task in
-`task-parts/manifest.json`; RPC or CLI carries only the short manifest
-instruction directing Prime to batch-read all task parts and stitch them
-into the complete task prompt before execution. `--no-tools` cannot read files,
-so it remains inline-only and limited to effective prompts of at most 1024 UTF-8 bytes.
+byte-perfect. Tools-enabled runs ship short tasks inline (see "Task context" for the
+threshold and integrity gate) and larger tasks through
+`task-parts/manifest.json`; RPC or CLI then carries only the short manifest
+instruction directing Prime to batch-read all task parts, verify the stitched
+checksum, and only then execute. `--no-tools` cannot read files, so it stays
+inline-only and limited to effective prompts of at most
+`--inline-task-bytes` UTF-8 bytes.
 
 Optional metadata:
 
@@ -111,6 +146,10 @@ Optional metadata:
 --task-type implementation|investigation|testing|prototype
 --delegation-mode implement|prototype|investigate
 --transport rpc|cli
+--task-part-bytes <200-8192>
+--inline-task-bytes <200-8192>
+--stage-context <windows-path>[@<start>-<end>] (repeatable)
+--no-staged-context
 ```
 
 ## Run storage
@@ -131,7 +170,9 @@ Each run retains:
 - `events.jsonl`, `stderr.log`, and `worker-prompt.md`;
 - `health.json`, `summary.json`, and `audit-summary.json` (enriched with tool call stats `totalToolCalls` and `failedToolCalls`);
 - `run-manifest.json`;
-- split `task-parts/` for large content regardless of RPC or CLI process mode;
+- split `task-parts/` with a `taskSha256` integrity manifest for content above the
+  inline threshold;
+- staged `context/` with `manifest.json` when `--stage-context` was used;
 - `codex-outcome.json` after Codex review.
 
 Semantic-compact capture preserves complete terminal messages, tool results,
@@ -192,6 +233,8 @@ Defaults:
 | `--no-change-timeout-ms` | 600000 |
 | `--no-change-max-tool-calls` | 80 |
 | `--repeated-tool-failure-limit` | 8 |
+| `--task-part-bytes` | 600 |
+| `--inline-task-bytes` | 1024 |
 | `--autonomous-max-continuations` | 3 |
 | `--autonomous-max-turns` | disabled |
 | `--autonomous-max-tokens` | 1000000 |
