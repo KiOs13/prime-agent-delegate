@@ -462,9 +462,10 @@ const workerRules = [
 	"For split tasks, read the manifest and every ordered part in one tool call, then stitch all parts into the full prompt.",
 	"Use targeted reads and batch independent reads in one tool call. Do not open worker-prompt.md; it is only an audit artifact.",
 	"Once a target range is found, do not reread overlapping ranges unless earlier output was missing.",
+	...options.noTools ? [] : ["Reading budget: finish all exploration in at most 4 tool calls, keep every read batched, and never reread a file. Every tool call after the 4th must follow the first allowed edit."],
 	"Run only focused checks for the bounded change. Leave full integration and regression suites to Codex after this worker session exits.",
 	options.requireChange
-		? `After locating the target, make the first allowed edit before further broad exploration and within ${noChangeTimeoutMs} ms or ${noChangeMaxToolCalls} tool calls.`
+		? `The no-change watchdog kills this process after ${noChangeTimeoutMs} ms or ${noChangeMaxToolCalls} tool calls without a file change. Make the first allowed edit within the first 4 tool calls, before writing assertions.`
 		: "Do not edit unless the task explicitly requests it.",
 	options.autonomous ? "The host runs final gates. Return changed files, checks, and blockers." : "Return one concise final report.",
 ];
@@ -522,7 +523,8 @@ if (options.noTools) {
 	const wslTaskPartsDir = toWslPath(taskPartsDir);
 	primeTask = [
 		`TASK MANIFEST: ${wslTaskPartsDir}/manifest.json`,
-		"Read the manifest and every exact listed part once in order in one tool call.",
+		`TASK PARTS: ${taskParts.map((part) => `${wslTaskPartsDir}/${part.name}`).join(" ")}`,
+		"Read the manifest and every exact TASK PARTS path once in order in one tool call.",
 		"After reading all parts, stitch them together into the complete task prompt and implement immediately.",
 		"",
 		...workerRules,

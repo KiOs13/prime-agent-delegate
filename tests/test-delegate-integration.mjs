@@ -84,8 +84,9 @@ test("default RPC uses task-parts for large prompts and seals artifacts", () => 
 	);
 	assert.match(
 		readFileSync(join(outDir, "worker-prompt.md"), "utf8"),
-		/Batch independent targeted reads|batch independent reads in one tool call/,
+		/Reading budget: finish all exploration in at most 4 tool calls/,
 	);
+	assert.match(readFileSync(join(outDir, "worker-prompt.md"), "utf8"), /Do not edit unless the task explicitly requests it\./);
 	const taskManifest = json(join(outDir, "task-parts", "manifest.json"));
 	assert.equal(taskManifest.parts.map((part) => readFileSync(join(outDir, "task-parts", part.name), "utf8")).join(""), prompt);
 	for (const part of taskManifest.parts) assert.equal(sha256(join(outDir, "task-parts", part.name)), part.sha256);
@@ -115,7 +116,8 @@ test("short tools-enabled RPC uses task-parts and preserves exact Unicode", () =
 	const cwd = createRepo();
 	const outDir = join(cwd, ".prime-delegate", "runs", "rpc-parts");
 	const prompt = "Проверка 世界 😀 \u2028\u2029";
-	const result = runDelegate({ cwd, outDir, prompt });
+	const promptEcho = join(outDir, "received-prompt.txt");
+	const result = runDelegate({ cwd, outDir, prompt, env: { PRIME_AGENT_DELEGATE_FAKE_PROMPT_ECHO: promptEcho } });
 	assert.equal(result.status, 0, result.stderr);
 	const summary = json(join(outDir, "summary.json"));
 	assert.equal(summary.transport.protocol, "rpc");
@@ -124,6 +126,10 @@ test("short tools-enabled RPC uses task-parts and preserves exact Unicode", () =
 	assert.equal(taskManifest.parts.map((part) => readFileSync(join(outDir, "task-parts", part.name), "utf8")).join(""), prompt.trim());
 	assert.equal(taskManifest.taskBytes, Buffer.byteLength(prompt.trim(), "utf8"));
 	assert.ok(taskManifest.parts.length >= 1);
+	const rpcPrompt = readFileSync(promptEcho, "utf8");
+	assert.match(rpcPrompt, /^TASK MANIFEST: \/.*\nTASK PARTS: \//);
+	for (const part of taskManifest.parts) assert.ok(rpcPrompt.includes(join(outDir, "task-parts", part.name).replaceAll("\\", "/")), part.name);
+	assert.match(rpcPrompt, /Read the manifest and every exact TASK PARTS path once in order in one tool call\./);
 });
 
 test("no-tools remains inline-only across transports", () => {
@@ -182,6 +188,7 @@ test("--require-change fails closed when Prime exits zero without an edit", () =
 		],
 	});
 	assert.equal(result.status, 1, result.stderr);
+	assert.match(readFileSync(join(outDir, "worker-prompt.md"), "utf8"), /Make the first allowed edit within the first 4 tool calls, before writing assertions\./);
 	const summary = json(join(outDir, "summary.json"));
 	assert.equal(summary.terminalReason, "required_change_missing");
 	assert.equal(summary.failureClass, "contract");

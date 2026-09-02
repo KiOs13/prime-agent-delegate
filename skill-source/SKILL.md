@@ -33,7 +33,9 @@ node <skill-dir>\scripts\delegate.mjs --check
 ```
 
 3. Write a self-contained task with scope, constraints, gates, and:
-   `Do not commit. Work only inside the supplied cwd.`
+   `Do not commit. Work only inside the supplied cwd.` Include exact target
+   anchors and name the first expected edit so Prime does not need broad
+   reconnaissance before changing a file.
 4. For edits, create a separate `codex/prime-agent-<slug>` worktree under
    `C:\Project-Prime\worktrees\<project>\<slug>`, where `<project>` is the
    repository directory name. Never let Prime and Codex edit the same
