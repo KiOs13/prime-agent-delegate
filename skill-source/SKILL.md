@@ -104,6 +104,14 @@ match it before any edit; a mismatch must be reported as `task_integrity_mismatc
 without changing files. `summary.transport.taskSha256` records the expected digest
 for run audits.
 
+Tools-enabled inline delivery carries a truncation guard: the wire prompt declares
+a run-unique expected token before the task and ends with the matching `TASK END
+MARKER: <hex>` line. If the final line is missing or altered, the worker reports
+`task_integrity_mismatch`; the launcher retries once through SHA-256-verified task
+parts, but only while the worktree still matches its baseline. `--no-tools` remains
+inline-only because it cannot read task parts. The audit artifact `worker-prompt.md`
+intentionally stays without the marker (wire-only rule).
+
 ## Modes
 
 Read-only investigation uses the default single-shot mode and explicitly

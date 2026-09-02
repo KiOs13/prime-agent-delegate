@@ -137,6 +137,15 @@ if (args[args.indexOf("--mode") + 1] === "rpc") {
 						emit({ id: command.id, type: "response", command: "prompt", success: false, error: "rejected" });
 						continue;
 					}
+					if (scenario === "inline-truncated" && !command.message.startsWith("TASK MANIFEST:")) {
+						emit({ id: command.id, type: "response", command: "prompt", success: true });
+						emit({ type: "agent_start" });
+						emit({ type: "turn_start" });
+						emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "task_integrity_mismatch" }] } });
+						emit({ type: "turn_end" });
+						emit({ type: "agent_end", messages: [] });
+						continue;
+					}
 					if (process.env.PRIME_AGENT_DELEGATE_FAKE_PROMPT_ECHO) {
 						writeFileSync(process.env.PRIME_AGENT_DELEGATE_FAKE_PROMPT_ECHO, command.message, "utf8");
 					}
@@ -160,6 +169,15 @@ if (args[args.indexOf("--mode") + 1] === "rpc") {
 		process.stderr.write("TASK MANIFEST must be the first split-prompt instruction\n");
 		process.exit(2);
 	}
-	makeChange();
-	emitScenario();
+	if (scenario === "inline-truncated" && !prompt.startsWith("TASK MANIFEST:")) {
+		emit({ type: "session", version: 3 });
+		emit({ type: "agent_start" });
+		emit({ type: "turn_start" });
+		emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "task_integrity_mismatch" }] } });
+		emit({ type: "turn_end" });
+		emit({ type: "agent_end", messages: [] });
+	} else {
+		makeChange();
+		emitScenario();
+	}
 }

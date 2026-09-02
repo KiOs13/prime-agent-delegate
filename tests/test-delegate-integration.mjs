@@ -155,6 +155,7 @@ test("no-tools remains inline-only across transports", () => {
 	assert.equal(inline.status, 0, inline.stderr);
 	assert.equal(json(join(inlineOut, "summary.json")).transport.protocol, "rpc");
 	assert.equal(json(join(inlineOut, "summary.json")).transport.mode, "inline");
+	assert.equal(json(join(inlineOut, "summary.json")).transport.inlineTaskEndMarker, null);
 	assert.equal(existsSync(join(inlineOut, "task-parts")), false);
 
 	const oversizedOut = join(cwd, ".prime-delegate", "runs", "no-tools-oversized");
@@ -166,6 +167,75 @@ test("no-tools remains inline-only across transports", () => {
 	});
 	assert.equal(oversized.status, 2);
 	assert.equal(existsSync(oversizedOut), false);
+});
+
+test("inline delivery carries a wire-only truncation marker and audit contract stays clean", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "inline-end-marker");
+	const prompt = "short inline task";
+	const echoPath = join(outDir, "echoed-prompt.txt");
+	const result = runDelegate({
+		cwd,
+		outDir,
+		prompt,
+		env: { PRIME_AGENT_DELEGATE_FAKE_PROMPT_ECHO: echoPath },
+	});
+	assert.equal(result.status, 0, result.stderr);
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.transport.mode, "inline");
+	const marker = summary.transport.inlineTaskEndMarker;
+	assert.match(String(marker), /^[0-9a-f]{16}$/, "marker is a 16-hex run-unique token");
+
+	const rpcPrompt = readFileSync(echoPath, "utf8");
+	assert.ok(rpcPrompt.includes(`TASK END MARKER: ${marker}`), "marker line rides on the wire");
+	assert.ok(rpcPrompt.includes("task_integrity_mismatch"), "truncation rule rides on the wire");
+	const wireLines = rpcPrompt.split("\n").map((line) => line.trim());
+	const markerLineIndex = wireLines.indexOf(`TASK END MARKER: ${marker}`);
+	const truncationRuleIndex = wireLines.findIndex((line) => line.startsWith("Before executing TASK"));
+	assert.ok(markerLineIndex > 0, "marker line present");
+	assert.ok(truncationRuleIndex < markerLineIndex, "truncation rule precedes the task and marker");
+	assert.equal(wireLines.at(-1), `TASK END MARKER: ${marker}`, "marker is the final line");
+
+	const auditPrompt = readFileSync(join(outDir, "worker-prompt.md"), "utf8");
+	assert.equal(auditPrompt.includes("TASK END MARKER"), false, "audit contract stays wire-only clean");
+
+	const partsOut = join(cwd, ".prime-delegate", "runs", "inline-end-marker-parts");
+	const partsResult = runDelegate({
+		cwd,
+		outDir: partsOut,
+		prompt: "p".repeat(400),
+		args: ["--inline-task-bytes", "200"],
+	});
+	assert.equal(partsResult.status, 0, partsResult.stderr);
+	const partsSummary = json(join(partsOut, "summary.json"));
+	assert.equal(partsSummary.transport.mode, "task-parts");
+	assert.equal(partsSummary.transport.inlineTaskEndMarker, null, "task-parts keeps its sha256 gate instead");
+});
+
+test("inline integrity mismatch retries once through task-parts", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "inline-fallback");
+	const result = runDelegate({ cwd, outDir, prompt: "short task", scenario: "inline-truncated" });
+	assert.equal(result.status, 0, result.stderr);
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.status, "completed");
+	assert.equal(summary.attemptCount, 2);
+	assert.equal(summary.transport.mode, "task-parts");
+	assert.equal(summary.transport.inlineFallbackUsed, true);
+	assert.equal(summary.transport.inlineTaskEndMarker, null);
+	assert.equal(existsSync(join(outDir, "task-parts", "manifest.json")), true);
+});
+
+test("CLI inline integrity mismatch also retries through task-parts", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "cli-inline-fallback");
+	const result = runDelegate({ cwd, outDir, prompt: "short CLI task", scenario: "inline-truncated", args: ["--transport", "cli"] });
+	assert.equal(result.status, 0, result.stderr);
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.attemptCount, 2);
+	assert.equal(summary.transport.protocol, "cli");
+	assert.equal(summary.transport.mode, "task-parts");
+	assert.equal(summary.transport.inlineFallbackUsed, true);
 });
 
 test("explicit CLI transport selects inline for short tasks and task-parts above the floor", () => {

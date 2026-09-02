@@ -593,10 +593,11 @@ const taskSha256 = createHash("sha256").update(prompt, "utf8").digest("hex");
 let taskPartCount = 0;
 let maxTaskPartBytes = 0;
 let transportMode;
-if (options.noTools || taskBytes <= inlineTaskBytes) {
-	transportMode = "inline";
-} else {
+let inlineTaskEndMarker = null;
+let inlineFallbackUsed = false;
+function configureTaskParts() {
 	transportMode = "task-parts";
+	inlineTaskEndMarker = null;
 	const taskPartsDir = join(outDir, "task-parts");
 	mkdirSync(taskPartsDir, { recursive: true });
 	const taskParts = splitUtf8ByBytes(prompt, taskChunkMaxBytes).map((content, index) => {
@@ -607,8 +608,7 @@ if (options.noTools || taskBytes <= inlineTaskBytes) {
 	});
 	taskPartCount = taskParts.length;
 	maxTaskPartBytes = Math.max(...taskParts.map((part) => part.bytes), 0);
-	const taskManifestPath = join(taskPartsDir, "manifest.json");
-	writeFileSync(taskManifestPath, `${JSON.stringify({ schemaVersion: 1, taskBytes, taskSha256, maxPartBytes: taskChunkMaxBytes, parts: taskParts }, null, 2)}\n`, "utf8");
+	writeFileSync(join(taskPartsDir, "manifest.json"), `${JSON.stringify({ schemaVersion: 1, taskBytes, taskSha256, maxPartBytes: taskChunkMaxBytes, parts: taskParts }, null, 2)}\n`, "utf8");
 	const wslTaskPartsDir = toWslPath(taskPartsDir);
 	primeTask = [
 		`TASK MANIFEST: ${wslTaskPartsDir}/manifest.json`,
@@ -619,6 +619,15 @@ if (options.noTools || taskBytes <= inlineTaskBytes) {
 		"",
 		...workerRules,
 	].join("\n");
+}
+if (options.noTools) {
+	transportMode = "inline";
+} else if (taskBytes <= inlineTaskBytes) {
+	transportMode = "inline";
+	inlineTaskEndMarker = randomUUID().replaceAll("-", "").slice(0, 16);
+	primeTask = `Before executing TASK, verify the final received line is exactly "TASK END MARKER: ${inlineTaskEndMarker}". If it is missing or altered, stop without editing and report task_integrity_mismatch.\n\n${auditTaskContract}\n\nTASK END MARKER: ${inlineTaskEndMarker}`;
+} else {
+	configureTaskParts();
 }
 const transport = {
 	mode: transportMode,
@@ -636,6 +645,8 @@ const transport = {
 	taskSha256,
 	partCount: taskPartCount,
 	maxPartBytes: maxTaskPartBytes,
+	inlineTaskEndMarker,
+	inlineFallbackUsed,
 };
 
 function buildRuntimeEnvironment() {
@@ -1164,6 +1175,28 @@ function onChildClose(code, signal) {
 			};
 		}
 		finalize(STATUS.FAILED, forcedTerminalReason, forcedTerminalReason);
+		return;
+	}
+	if (transportMode === "inline" && finalText.trim() === "task_integrity_mismatch") {
+		const porcelainResult = currentGitPorcelain();
+		if (!porcelainResult.ok || porcelainResult.value !== gitContext.baseline || options.noTools || inlineFallbackUsed) {
+			finalize(STATUS.FAILED, "task_integrity_mismatch", "inline_integrity_fallback_unavailable", porcelainResult.ok ? porcelainResult.value : undefined);
+			return;
+		}
+		inlineFallbackUsed = true;
+		finalText = "";
+		configureTaskParts();
+		Object.assign(transport, {
+			mode: transportMode,
+			effectiveInitialPromptBytes: Buffer.byteLength(primeTask, "utf8"),
+			wireBytes: requestedTransport === "rpc" ? Buffer.byteLength(`${JSON.stringify({ id: "delegate-prompt", type: "prompt", message: primeTask })}\n`, "utf8") : Buffer.byteLength(primeTask, "utf8"),
+			partCount: taskPartCount,
+			maxPartBytes: maxTaskPartBytes,
+			inlineTaskEndMarker,
+			inlineFallbackUsed,
+		});
+		appendSyntheticEvent({ kind: "inline_integrity_fallback", nextTransportMode: "task-parts" });
+		spawnAttempt();
 		return;
 	}
 
