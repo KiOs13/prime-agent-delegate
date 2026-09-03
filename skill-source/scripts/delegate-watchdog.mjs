@@ -35,6 +35,7 @@ export const FAILURE_KIND = Object.freeze({
 	NO_CHANGE_PROGRESS: "no_change_progress",
 	REPEATED_TOOL_FAILURE: "repeated_tool_failure",
 	MAX_TURNS_EXHAUSTED: "max_turns_exhausted",
+	RUNAWAY_TURNS: "runaway_turns",
 });
 
 const ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
@@ -368,6 +369,9 @@ export function classifyChildExit({
 	if (watchdogCondition === FAILURE_KIND.MAX_TURNS_EXHAUSTED) {
 		return result("failed", FAILURE_KIND.MAX_TURNS_EXHAUSTED, STATUS.FAILED, "prime_limit", "prime_agent");
 	}
+	if (watchdogCondition === FAILURE_KIND.RUNAWAY_TURNS) {
+		return result("failed", FAILURE_KIND.RUNAWAY_TURNS, STATUS.FAILED, "provider", "provider");
+	}
 	if (spawnFailed) {
 		return result("config_error", "spawn_error", STATUS.FAILED, "spawn", "environment");
 	}
@@ -428,6 +432,24 @@ export function shouldStopForNoChange({
 } = {}) {
 	if (!requireChange || changeDetected) return false;
 	return elapsedMs >= timeoutMs || toolCallCount >= maxToolCalls;
+}
+
+// Track "runaway turns": consecutive turns that consumed the full output
+// token budget (stopReason "length") without any tool call and without any
+// non-empty assistant text. The model keeps regenerating silently instead of
+// making progress. Any productive turn resets the streak; limit < 1 disables.
+export function stepRunawayTurnTracking({
+	streak = 0,
+	limit = 0,
+	stopReason = null,
+	toolCalls = 0,
+	hadText = false,
+	outputTokens = null,
+} = {}) {
+	if (limit < 1) return { streak: 0, stop: false, reason: "disabled" };
+	if (stopReason !== "length" || toolCalls > 0 || hadText) return { streak: 0, stop: false, reason: "reset" };
+	const nextStreak = streak + 1;
+	return { streak: nextStreak, stop: nextStreak >= limit, reason: nextStreak >= limit ? "limit_reached" : "streak_growing" };
 }
 
 function stableErrorText(value) {

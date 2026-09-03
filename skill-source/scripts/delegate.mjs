@@ -34,6 +34,7 @@ import {
 	recordValidEvent,
 	shouldStopForNoChange,
 	splitUtf8ByBytes,
+	stepRunawayTurnTracking,
 	terminalStatusFor,
 	updateHealth,
 	windowsProcessAlive,
@@ -55,6 +56,7 @@ const DEFAULT_RESTART_DELAY_MS = 5000;
 const DEFAULT_NO_CHANGE_TIMEOUT_MS = 600000;
 const DEFAULT_NO_CHANGE_MAX_TOOL_CALLS = 80;
 const DEFAULT_REPEATED_TOOL_FAILURE_LIMIT = 8;
+const DEFAULT_RUNAWAY_TURNS_LIMIT = 2;
 const DEFAULT_AUTONOMOUS_MAX_CONTINUATIONS = 3;
 const DEFAULT_AUTONOMOUS_MAX_TOKENS = 1000000;
 const INLINE_TASK_MAX_BYTES = 1024;
@@ -82,6 +84,7 @@ function parseArgs(argv) {
 		"--autonomous-max-continuations", "--autonomous-max-turns", "--autonomous-max-tokens",
 		"--startup-grace-ms", "--idle-timeout-ms", "--max-infra-restarts", "--restart-delay-ms",
 		"--no-change-timeout-ms", "--no-change-max-tool-calls", "--repeated-tool-failure-limit", "--status-dir",
+		"--runaway-turns-limit",
 	]);
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
@@ -367,25 +370,32 @@ function sleepSync(ms) {
 	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-function linuxProcessAlive(pid) {
-	const stat = spawnSync("cat", [`/proc/${pid}/stat`], { encoding: "utf8" });
-	return stat.status === 0 && isLinuxProcessRunningFromStat(stat.stdout);
+function linuxProcessGroupAlive(groupId) {
+	for (const entry of readdirSync("/proc", { withFileTypes: true })) {
+		if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+		try {
+			const stat = readFileSync(`/proc/${entry.name}/stat`, "utf8");
+			const fields = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
+			if (Number(fields[2]) === groupId && !["Z", "X"].includes(fields[0])) return true;
+		} catch { /* process exited while /proc was scanned */ }
+	}
+	return false;
 }
 
 function terminateProcessTree(pid) {
-// Terminate only the exact spawned wsl.exe process tree: normal termination
-// first, then a bounded grace, then exact-PID taskkill /T /F if still alive.
+	// WSL workers own a process group; Windows uses the exact wsl.exe tree.
+	// Try graceful termination first, then force the same bounded target.
 	if (WSL_MODE) {
-		try { spawnSync("kill", ["-TERM", String(pid)], { encoding: "utf8" }); } catch { /* ignore */ }
+		try { process.kill(-pid, "SIGTERM"); } catch { /* checked below */ }
 		const deadline = Date.now() + TERMINATE_GRACE_MS;
 		while (Date.now() < deadline) {
-			if (!linuxProcessAlive(pid)) return "terminated";
+			if (!linuxProcessGroupAlive(pid)) return "terminated";
 			sleepSync(100);
 		}
-		try { spawnSync("kill", ["-9", String(pid)], { encoding: "utf8" }); } catch { /* ignore */ }
+		try { process.kill(-pid, "SIGKILL"); } catch { /* checked below */ }
 		const forceDeadline = Date.now() + TERMINATE_GRACE_MS;
 		while (Date.now() < forceDeadline) {
-			if (!linuxProcessAlive(pid)) return "force_terminated";
+			if (!linuxProcessGroupAlive(pid)) return "force_terminated";
 			sleepSync(100);
 		}
 		return "termination_failed";
@@ -467,6 +477,7 @@ if (options.prepareCommand) {
 	if (options.noChangeTimeoutMs) parts.push("--no-change-timeout-ms", options.noChangeTimeoutMs);
 	if (options.noChangeMaxToolCalls) parts.push("--no-change-max-tool-calls", options.noChangeMaxToolCalls);
 	if (options.repeatedToolFailureLimit) parts.push("--repeated-tool-failure-limit", options.repeatedToolFailureLimit);
+	if (options.runawayTurnsLimit !== undefined) parts.push("--runaway-turns-limit", options.runawayTurnsLimit);
 	if (options.taskPartBytes) parts.push("--task-part-bytes", options.taskPartBytes);
 	if (options.inlineTaskBytes) parts.push("--inline-task-bytes", options.inlineTaskBytes);
 	for (const spec of options.stagedContext) parts.push("--stage-context", windowsPathToWslPath(spec));
@@ -513,6 +524,11 @@ const repeatedToolFailureLimit = parseIntOption(
 	options.repeatedToolFailureLimit ?? DEFAULT_REPEATED_TOOL_FAILURE_LIMIT,
 	"--repeated-tool-failure-limit",
 	{ min: 1 },
+);
+const runawayTurnsLimit = parseIntOption(
+	options.runawayTurnsLimit ?? DEFAULT_RUNAWAY_TURNS_LIMIT,
+	"--runaway-turns-limit",
+	{ min: 0, max: 10 },
 );
 const autonomousMaxContinuations = parseIntOption(options.autonomousMaxContinuations ?? DEFAULT_AUTONOMOUS_MAX_CONTINUATIONS, "--autonomous-max-continuations", { min: 1 });
 const autonomousMaxTurns = options.autonomousMaxTurns === undefined
@@ -753,6 +769,10 @@ let rpcStateId = null;
 let rpcPromptId = null;
 let repeatedToolFailure = { fingerprint: null, count: 0, toolName: null };
 let finalUnauthorizedChanges = [];
+let currentTurnToolCalls = 0;
+let currentTurnHadText = false;
+let runawayStreak = 0;
+let runawayTurnsObserved = 0;
 
 function flushHealth() {
 	if (healthWriteTimer) {
@@ -865,7 +885,7 @@ function processEventLine(rawLine) {
 
 function onValidEvent(event) {
 	if (forcedTerminalReason) return;
-	if ([FAILURE_KIND.REPEATED_TOOL_FAILURE, FAILURE_KIND.MAX_TURNS_EXHAUSTED].includes(pendingCondition)) return;
+	if ([FAILURE_KIND.REPEATED_TOOL_FAILURE, FAILURE_KIND.MAX_TURNS_EXHAUSTED, FAILURE_KIND.RUNAWAY_TURNS].includes(pendingCondition)) return;
 	const wasFirstEvent = !firstEventSeen;
 	firstEventSeen = true;
 	if (wasFirstEvent && requestedTransport !== "rpc") armNoChangeTimer();
@@ -904,6 +924,41 @@ function onValidEvent(event) {
 		})) {
 			pendingCondition = FAILURE_KIND.NO_CHANGE_PROGRESS;
 			terminateChild(FAILURE_KIND.NO_CHANGE_PROGRESS);
+			return;
+		}
+	}
+	if (turnStart) {
+		currentTurnToolCalls = 0;
+		currentTurnHadText = false;
+	}
+	if (event?.type === "tool_execution_start") {
+		currentTurnToolCalls++;
+	}
+	if (event?.type === "message_end") {
+		currentTurnHadText = currentTurnHadText || assistantText(event.message).length > 0;
+	}
+	if (event?.type === "turn_end") {
+		const message = event?.message ?? null;
+		const step = stepRunawayTurnTracking({
+			streak: runawayStreak,
+			limit: runawayTurnsLimit,
+			stopReason: event?.stopReason ?? message?.stopReason ?? null,
+			toolCalls: currentTurnToolCalls,
+			hadText: currentTurnHadText,
+		});
+		runawayStreak = step.streak;
+		runawayTurnsObserved = Math.max(runawayTurnsObserved, step.streak);
+		currentTurnToolCalls = 0;
+		currentTurnHadText = false;
+		if (step.stop) {
+			pendingCondition = FAILURE_KIND.RUNAWAY_TURNS;
+			appendSyntheticEvent({
+				kind: FAILURE_KIND.RUNAWAY_TURNS,
+				limit: runawayTurnsLimit,
+				streak: step.streak,
+				outputTokens: message?.usage?.output ?? null,
+			});
+			terminateChild(FAILURE_KIND.RUNAWAY_TURNS);
 			return;
 		}
 	}
@@ -1035,6 +1090,9 @@ function spawnAttempt() {
 	rpcPromptId = `delegate-prompt-${attempt}`;
 	repeatedToolFailure = { fingerprint: null, count: 0, toolName: null };
 	noChangeWindowStartedAt = null;
+	currentTurnToolCalls = 0;
+	currentTurnHadText = false;
+	runawayStreak = 0;
 	transport.handshakeAccepted = requestedTransport === "rpc" ? false : null;
 	transport.promptAccepted = requestedTransport === "rpc" ? false : null;
 	stdoutBuffer = "";
@@ -1044,12 +1102,12 @@ function spawnAttempt() {
 	const primeArgs = buildPrimeArgs();
 	if (requestedTransport === "rpc") {
 		child = WSL_MODE
-			? spawn(primeArgs[0], primeArgs.slice(1), { cwd: wslCwd, stdio: ["pipe", "pipe", "pipe"] })
+			? spawn(primeArgs[0], primeArgs.slice(1), { cwd: wslCwd, detached: true, stdio: ["pipe", "pipe", "pipe"] })
 			: spawn("wsl.exe", ["--cd", wslCwd, "--", ...primeArgs], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
 	} else {
 		const primeCmd = shellJoin(primeArgs);
 		const fullCmd = `cd ${shellQuote(wslCwd)} && ${primeCmd}`;
-		child = WSL_MODE ? spawn("bash", ["-lc", fullCmd], { stdio: ["ignore", "pipe", "pipe"] }) : spawn("wsl.exe", ["bash", "-lc", fullCmd], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+		child = WSL_MODE ? spawn("bash", ["-lc", fullCmd], { detached: true, stdio: ["ignore", "pipe", "pipe"] }) : spawn("wsl.exe", ["bash", "-lc", fullCmd], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
 	}
 
 	health = recordAttemptStart(health, { attempt, childPid: child.pid, now: Date.now() });
@@ -1304,7 +1362,7 @@ function onChildClose(code, signal) {
 	}
 
 	if (classification.kind === "completed" || classification.kind === "timed_out" || classification.kind === "failed" || classification.kind === "config_error") {
-		const porcelain = [FAILURE_KIND.REPEATED_TOOL_FAILURE, FAILURE_KIND.MAX_TURNS_EXHAUSTED].includes(classification.reason)
+		const porcelain = [FAILURE_KIND.REPEATED_TOOL_FAILURE, FAILURE_KIND.MAX_TURNS_EXHAUSTED, FAILURE_KIND.RUNAWAY_TURNS].includes(classification.reason)
 			? currentGitPorcelain()
 			: null;
 		finalize(
@@ -1426,6 +1484,8 @@ function finalize(status, reason, decisionReason, worktreeDiff) {
 			: null,
 		repeatedToolFailureCount: health.repeatedToolFailureCount,
 		repeatedToolFailureTool: health.repeatedToolFailureTool,
+		runawayTurnsLimit,
+		runawayTurnsObserved,
 		observedTurnCount: health.attemptTurnCount,
 		maxInfraRestarts,
 		restartDelayMs,
@@ -1513,5 +1573,34 @@ function finalize(status, reason, decisionReason, worktreeDiff) {
 	events.end(finish);
 	errors.end(finish);
 }
+
+function onInterruptSignal(signal) {
+	if (finalized) return;
+	appendSyntheticEvent({ kind: "interrupted", signal });
+	lastClassification = {
+		kind: "failed",
+		reason: "interrupted",
+		terminalStatus: STATUS.FAILED,
+		failureClass: "process",
+		failureOwner: "environment",
+	};
+	writeHealthWithReason("interrupted");
+	terminateChild(`interrupted_${signal.toLowerCase()}`);
+	if (forcedTerminalReason) {
+		lastClassification = {
+			kind: "failed",
+			reason: forcedTerminalReason,
+			terminalStatus: STATUS.FAILED,
+			failureClass: "process",
+			failureOwner: "environment",
+		};
+		finalize(STATUS.FAILED, forcedTerminalReason, forcedTerminalReason);
+		return;
+	}
+	finalize(STATUS.FAILED, "interrupted", `interrupted_by_${signal.toLowerCase()}`);
+}
+
+process.on("SIGINT", () => onInterruptSignal("SIGINT"));
+process.on("SIGTERM", () => onInterruptSignal("SIGTERM"));
 
 spawnAttempt();

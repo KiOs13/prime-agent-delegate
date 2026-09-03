@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -18,7 +19,7 @@ const scenario = process.env.PRIME_AGENT_DELEGATE_FAKE_SCENARIO ?? "normal";
 const cwdIndex = args.indexOf("--cwd");
 const cwd = cwdIndex >= 0 ? args[cwdIndex + 1] : null;
 function makeChange() {
-	if (scenario === "no-change" || scenario === "hang-after-prompt") return;
+	if (["no-change", "hang-after-prompt", "hang-with-descendant"].includes(scenario)) return;
 	if (!(args.includes("--autonomous") || process.env.PRIME_AGENT_DELEGATE_FAKE_FORCE_CHANGE === "1") || !cwd || !existsSync(cwd)) return;
 	writeFileSync(
 		join(cwd, process.env.PRIME_AGENT_DELEGATE_FAKE_CHANGE ?? "fake-prime-output.txt"),
@@ -99,6 +100,24 @@ function emitScenario({ includeSession = true } = {}) {
 		emit({ type: "agent_end", messages: [] });
 		return;
 	}
+	if (scenario === "runaway-turns") {
+		if (includeSession) emit({ type: "session", version: 3 });
+		emit({ type: "agent_start" });
+		// Turn 1: productive (tool call + text) - must reset the streak.
+		emit({ type: "turn_start", turn: 1 });
+		emit({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "read", args: { path: "README.md" } });
+		emit({ type: "tool_execution_end", toolCallId: "tool-1", toolName: "read", result: { content: "ok" } });
+		emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "reading done" }] } });
+		emit({ type: "turn_end", turn: 1 });
+		// Turns 2 and 3: silent full-budget turns (no tool call, no text).
+		for (let index = 2; index <= 3; index++) {
+			emit({ type: "turn_start", turn: index });
+			emit({ type: "message_end", message: { role: "assistant", content: [], usage: { output: 16384 }, stopReason: "length" } });
+			emit({ type: "turn_end", turn: index, message: { role: "assistant", content: [], usage: { output: 16384 }, stopReason: "length" } });
+		}
+		emit({ type: "agent_end", messages: [] });
+		return;
+	}
 	for (const event of lifecycle) emit(event);
 }
 
@@ -151,9 +170,13 @@ if (args[args.indexOf("--mode") + 1] === "rpc") {
 					}
 					makeChange();
 					emit({ id: command.id, type: "response", command: "prompt", success: true });
-					if (scenario === "hang-after-prompt") {
+					if (scenario === "hang-after-prompt" || scenario === "hang-with-descendant") {
 						// Emit one event so the delegate sees a live agent, then hang without changes.
 						emit({ type: "turn_start" });
+						if (scenario === "hang-with-descendant") {
+							const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 60000)"], { stdio: "ignore" });
+							writeFileSync(process.env.PRIME_AGENT_DELEGATE_FAKE_CHILD_PID_FILE, String(descendant.pid), "utf8");
+						}
 						Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 600000);
 					}
 					emitScenario({ includeSession: false });

@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -285,6 +285,46 @@ test("no-change watchdog still stops a hanging worker after prompt acceptance", 
 	assert.equal(summary.terminalReason, "no_change_progress");
 });
 
+test("runaway empty length turns stop the worker as runaway_turns", () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "runaway-turns");
+	const result = runDelegate({
+		cwd,
+		outDir,
+		scenario: "runaway-turns",
+		prompt: "work until the quality gate passes",
+		args: [
+			"--autonomous",
+			"--require-change",
+			"--allow-change", "fake-prime-output.txt",
+			"--autonomous-gate", "true",
+			"--delegation-mode", "implement",
+			"--runaway-turns-limit", "2",
+			"--max-infra-restarts", "0",
+		],
+	});
+	assert.equal(result.status, 1, result.stderr);
+
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.status, "failed");
+	assert.equal(summary.terminalReason, "runaway_turns");
+	assert.equal(summary.failureClass, "provider");
+	assert.equal(summary.failureOwner, "provider");
+	assert.equal(summary.runawayTurnsLimit, 2);
+	assert.equal(summary.runawayTurnsObserved, 2);
+
+	const health = json(join(outDir, "health.json"));
+	assert.equal(health.status, "failed");
+
+	const events = readFileSync(join(outDir, "events.jsonl"), "utf8");
+	assert.match(events, /"type":"watchdog_event","kind":"runaway_turns"/);
+	assert.match(events, /"kind":"terminate","reason":"runaway_turns"/);
+
+	const audit = json(join(outDir, "audit-summary.json"));
+	assert.equal(audit.run.status, "failed");
+	assert.equal(audit.source.lineCount > 0, true);
+});
+
 test("no-change window starts at RPC prompt acceptance, not at spawn", () => {
 	const cwd = createRepo();
 	const outDir = join(cwd, ".prime-delegate", "runs", "no-change-deferred-window");
@@ -371,18 +411,19 @@ test("--transport invalid exits with code 2 before creating out-dir", () => {
 	assert.equal(existsSync(outDir), false);
 });
 
-test("--prepare-command forwards transport and repeated failure limit", () => {
+test("--prepare-command forwards transport and watchdog limits, including zero", () => {
 	const cwd = createRepo();
 	const outDir = join(cwd, ".prime-delegate", "runs", "prepare-cli");
 	const result = runDelegate({
 		cwd,
 		outDir,
 		prompt: "prepare cli",
-		args: ["--prepare-command", "--transport", "cli", "--repeated-tool-failure-limit", "5"],
+		args: ["--prepare-command", "--transport", "cli", "--repeated-tool-failure-limit", "5", "--runaway-turns-limit", "0"],
 	});
 	assert.equal(result.status, 0, result.stderr);
 	assert.match(result.stdout, /'--transport' 'cli'/);
 	assert.match(result.stdout, /'--repeated-tool-failure-limit' '5'/);
+	assert.match(result.stdout, /'--runaway-turns-limit' '0'/);
 
 	const enriched = runDelegate({
 		cwd,
@@ -391,12 +432,14 @@ test("--prepare-command forwards transport and repeated failure limit", () => {
 		args: [
 			"--prepare-command",
 			"--task-part-bytes", "1200",
+			"--runaway-turns-limit", "7",
 			"--stage-context", "C:\\ctx\\spec.md",
 			"--stage-context", "C:\\ctx\\guard.php@10-20",
 		],
 	});
 	assert.equal(enriched.status, 0, enriched.stderr);
 	assert.match(enriched.stdout, /'--task-part-bytes' '1200'/);
+	assert.match(enriched.stdout, /'--runaway-turns-limit' '7'/);
 	assert.match(enriched.stdout, /'--stage-context' '\/mnt\/c\/ctx\/spec\.md'/);
 	assert.match(enriched.stdout, /'--stage-context' '\/mnt\/c\/ctx\/guard\.php@10-20'/);
 });
@@ -800,4 +843,94 @@ test("inline threshold boundary and integrity manifest", () => {
 	const wirePrompt = readFileSync(join(outAbove, "echoed-prompt.json"), "utf8");
 	assert.match(wirePrompt, /Verify the stitched task: `cat <every TASK PARTS path in order> \| sha256sum` must equal the manifest taskSha256/);
 	assert.match(wirePrompt, /task_integrity_mismatch/);
+});
+
+test("SIGINT finalizes the run as interrupted with full artifacts", async () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "sigint-interrupted");
+	const promptFile = join(mkdtempSync(join(tmpdir(), "prime-delegate-task-")), "task.md");
+	writeFileSync(promptFile, "hang without changes", "utf8");
+	const child = spawn(process.execPath, [
+		DELEGATE,
+		"--wsl-mode",
+		"--cwd", cwd,
+		"--prompt-file", promptFile,
+		"--out-dir", outDir,
+		"--timeout-ms", "20000",
+		"--startup-grace-ms", "5000",
+		"--idle-timeout-ms", "8000",
+		"--max-infra-restarts", "0",
+	], {
+		encoding: "utf8",
+		env: {
+			...process.env,
+			GIT_DIR: undefined,
+			GIT_WORK_TREE: undefined,
+			PRIME_AGENT_DELEGATE_TEST_MODE: "1",
+			PRIME_AGENT_DELEGATE_TEST_EXEC: FAKE_PRIME,
+			PRIME_AGENT_DELEGATE_FAKE_SCENARIO: "hang-after-prompt",
+		},
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	const exited = new Promise((resolveExit) => child.on("close", (code, signal) => resolveExit({ code, signal })));
+	// Wait for the run directory + health.json to appear before interrupting.
+	const healthPath = join(outDir, "health.json");
+	const deadline = Date.now() + 15000;
+	while (!existsSync(healthPath) && Date.now() < deadline) {
+		await new Promise((tick) => setTimeout(tick, 100));
+	}
+	assert.equal(existsSync(healthPath), true, "health.json should exist before SIGINT");
+	child.kill("SIGINT");
+	const result = await exited;
+	assert.equal(result.code, 1, `exit code, signal=${result.signal}`);
+
+	const summary = json(join(outDir, "summary.json"));
+	assert.equal(summary.status, "failed");
+	assert.equal(summary.terminalReason, "interrupted");
+	assert.equal(summary.failureClass, "process");
+	assert.equal(summary.failureOwner, "environment");
+
+	const health = json(healthPath);
+	assert.equal(health.status, "failed");
+	assert.ok(existsSync(join(outDir, "audit-summary.json")));
+	assert.ok(existsSync(join(outDir, "run-manifest.json")));
+});
+
+test("SIGINT terminates the complete WSL worker process group", async () => {
+	const cwd = createRepo();
+	const outDir = join(cwd, ".prime-delegate", "runs", "sigint-process-group");
+	const promptFile = join(mkdtempSync(join(tmpdir(), "prime-delegate-task-")), "task.md");
+	const descendantPidFile = join(mkdtempSync(join(tmpdir(), "prime-delegate-pid-")), "descendant.pid");
+	writeFileSync(promptFile, "hang with descendant", "utf8");
+	const child = spawn(process.execPath, [
+		DELEGATE,
+		"--wsl-mode",
+		"--cwd", cwd,
+		"--prompt-file", promptFile,
+		"--out-dir", outDir,
+		"--timeout-ms", "20000",
+		"--startup-grace-ms", "5000",
+		"--idle-timeout-ms", "8000",
+		"--max-infra-restarts", "0",
+	], {
+		env: {
+			...process.env,
+			GIT_DIR: undefined,
+			GIT_WORK_TREE: undefined,
+			PRIME_AGENT_DELEGATE_TEST_MODE: "1",
+			PRIME_AGENT_DELEGATE_TEST_EXEC: FAKE_PRIME,
+			PRIME_AGENT_DELEGATE_FAKE_SCENARIO: "hang-with-descendant",
+			PRIME_AGENT_DELEGATE_FAKE_CHILD_PID_FILE: descendantPidFile,
+		},
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	const exited = new Promise((resolveExit) => child.on("close", (code, signal) => resolveExit({ code, signal })));
+	const deadline = Date.now() + 15000;
+	while (!existsSync(descendantPidFile) && Date.now() < deadline) await new Promise((tick) => setTimeout(tick, 100));
+	assert.equal(existsSync(descendantPidFile), true, "fake descendant should start before SIGINT");
+	const descendantPid = Number(readFileSync(descendantPidFile, "utf8"));
+	child.kill("SIGINT");
+	const result = await exited;
+	assert.equal(result.code, 1, `exit code, signal=${result.signal}`);
+	assert.equal(existsSync(`/proc/${descendantPid}`), false, `descendant ${descendantPid} survived SIGINT`);
 });

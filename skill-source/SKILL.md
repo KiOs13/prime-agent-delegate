@@ -241,6 +241,7 @@ Defaults:
 | `--no-change-timeout-ms` | 600000 (RPC: starts at prompt acceptance; CLI: at the first valid event) |
 | `--no-change-max-tool-calls` | 80 |
 | `--repeated-tool-failure-limit` | 8 |
+| `--runaway-turns-limit` | 2 (0 = disabled) |
 | `--task-part-bytes` | 600 |
 | `--inline-task-bytes` | 1024 |
 | `--autonomous-max-continuations` | 3 |
@@ -253,6 +254,14 @@ configuration, and changed-worktree failures do not retry.
 The launcher also stops eight consecutive identical failed tool
 completions as `repeated_tool_failure` (`tool_loop`, owned by `prime_agent`)
 while preserving the partial worktree.
+`--runaway-turns-limit <N>` stops the run after N consecutive turns that
+ended with `stopReason: "length"`, produced no tool call, and emitted no
+non-empty assistant text (`runaway_turns`, `provider`-owned, no restart,
+partial worktree preserved). `0` disables this watchdog.
+SIGINT/SIGTERM received by the launcher finalize the run immediately as
+`status: "failed"`, `terminalReason: "interrupted"`, kill the worker process
+tree, and write the full artifact set (summary, audit, run manifest,
+terminal health) — no stale `running` health.json is left behind.
 `--require-change` is also checked by the launcher at process completion; exit
 0 without a worktree change fails as `required_change_missing`.
 `--autonomous-max-turns <N>` is an optional explicit guard. When set, the

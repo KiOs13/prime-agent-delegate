@@ -43,6 +43,7 @@ import {
 	recordTerminal,
 	recordValidEvent,
 	shouldStopForNoChange,
+	stepRunawayTurnTracking,
 	splitUtf8ByBytes,
 	terminalStatusFor,
 } from "../skill-source/scripts/delegate-watchdog.mjs";
@@ -266,6 +267,40 @@ test("launcher turn limit is a terminal Prime limit", () => {
 	assert.equal(cls.failureClass, "prime_limit");
 	assert.equal(cls.failureOwner, "prime_agent");
 	assert.equal(decideRestart(restartArgs({ kind: cls.kind })).restart, false);
+});
+
+test("runaway turns are terminal provider failures", () => {
+	const cls = classifyChildExit({ watchdogCondition: FAILURE_KIND.RUNAWAY_TURNS });
+	assert.equal(cls.kind, "failed");
+	assert.equal(cls.reason, FAILURE_KIND.RUNAWAY_TURNS);
+	assert.equal(cls.failureClass, "provider");
+	assert.equal(cls.failureOwner, "provider");
+	assert.equal(isInfraFailure(cls.kind), false);
+	const decision = decideRestart(restartArgs({ kind: cls.kind }));
+	assert.equal(decision.restart, false);
+	assert.equal(decision.reason, "failed_not_restartable");
+});
+
+test("stepRunawayTurnTracking detects silent length turns and resets on progress", () => {
+	// Disabled (limit 0).
+	let step = stepRunawayTurnTracking({ streak: 0, limit: 0, stopReason: "length", toolCalls: 0, hadText: false });
+	assert.deepEqual(step, { streak: 0, stop: false, reason: "disabled" });
+
+	// Productive turn resets the streak.
+	step = stepRunawayTurnTracking({ streak: 1, limit: 2, stopReason: "stop", toolCalls: 2, hadText: true });
+	assert.deepEqual(step, { streak: 0, stop: false, reason: "reset" });
+	step = stepRunawayTurnTracking({ streak: 1, limit: 2, stopReason: "length", toolCalls: 1, hadText: false });
+	assert.deepEqual(step, { streak: 0, stop: false, reason: "reset" });
+	step = stepRunawayTurnTracking({ streak: 1, limit: 2, stopReason: "length", toolCalls: 0, hadText: true });
+	assert.deepEqual(step, { streak: 0, stop: false, reason: "reset" });
+
+	// First silent length turn grows the streak without stopping.
+	step = stepRunawayTurnTracking({ streak: 0, limit: 2, stopReason: "length", toolCalls: 0, hadText: false });
+	assert.deepEqual(step, { streak: 1, stop: false, reason: "streak_growing" });
+
+	// Second consecutive silent length turn trips the limit.
+	step = stepRunawayTurnTracking({ streak: 1, limit: 2, stopReason: "length", toolCalls: 0, hadText: false });
+	assert.deepEqual(step, { streak: 2, stop: true, reason: "limit_reached" });
 });
 
 test("worker receives the task contract inline without an @file lookup", () => {
