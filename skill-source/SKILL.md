@@ -39,8 +39,17 @@ node <skill-dir>\scripts\delegate.mjs --check
    `Do not commit. Work only inside the supplied cwd.`
 5. For edits, create a separate `codex/prime-agent-<slug>` worktree under
    `C:\Project-Prime\worktrees\<project>\<slug>`, where `<project>` is the
-   repository directory name. Never let Prime and Codex edit the same
-   worktree concurrently.
+   repository directory name. Use LF checkout defaults for fresh Windows worktrees:
+
+```powershell
+git -c core.autocrlf=false -c core.eol=lf worktree add -b codex/prime-agent-<slug> "C:\Project-Prime\worktrees\<project>\<slug>" <base-ref>
+```
+
+   The `-c` settings apply only to creation; `.gitattributes` still takes
+   precedence. This avoids CRLF-only differences when WSL and Windows have
+   different `core.autocrlf` settings. Do not normalize existing files or
+   ignore real diffs to pass the clean-tree check. Never let Prime and Codex
+   edit the same worktree concurrently.
 6. Keep the task file outside the delegated worktree, under
    `C:\Project-Prime\runs\<project>\` next to that project's run folders
    (for example `C:\Project-Prime\runs\Prime-agent-delegate\smoke-task.md`),

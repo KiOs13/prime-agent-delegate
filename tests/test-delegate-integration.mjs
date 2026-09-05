@@ -60,6 +60,51 @@ function sha256(path) {
 	return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
+test("LF linked worktrees preserve clean, dirty, and read-only gates", () => {
+	const repo = createRepo();
+	for (const mode of ["allowed", "dirty", "read-only"]) {
+		const cwd = join(mkdtempSync(join(tmpdir(), "prime-delegate-linked-")), "worktree");
+		const created = spawnSync("git", [
+			"-c", "core.autocrlf=false", "-c", "core.eol=lf",
+			"worktree", "add", "--detach", cwd, "HEAD",
+		], {
+			cwd: repo, encoding: "utf8",
+			env: {
+				...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined,
+				// Simulate the Windows checkout default without touching user config.
+				GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.autocrlf", GIT_CONFIG_VALUE_0: "true",
+			},
+		});
+		assert.equal(created.status, 0, created.stderr);
+		assert.equal(readFileSync(join(cwd, ".gitignore"), "utf8"), ".prime-delegate/\n");
+		if (mode === "dirty") writeFileSync(join(cwd, ".gitignore"), ".prime-delegate/\nreal edit\n");
+		const outDir = join(cwd, ".prime-delegate", "run");
+		const result = runDelegate({
+			cwd, outDir, prompt: "create one allowed file",
+			args: mode === "read-only" ? [] : [
+				"--autonomous", "--require-change", "--allow-change", "fake-prime-output.txt",
+				"--autonomous-gate", "test -f fake-prime-output.txt", "--delegation-mode", "implement",
+			],
+			env: {
+				PRIME_AGENT_DELEGATE_FAKE_FORCE_CHANGE: "1",
+				GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.autocrlf", GIT_CONFIG_VALUE_0: "false",
+			},
+		});
+		if (mode === "dirty") {
+			assert.equal(result.status, 2, result.stderr);
+			assert.match(result.stderr, /--require-change requires a clean delegated worktree/);
+			assert.equal(existsSync(join(cwd, "fake-prime-output.txt")), false);
+			continue;
+		}
+		assert.equal(result.status, mode === "allowed" ? 0 : 1, result.stderr);
+		const summary = json(join(outDir, "summary.json"));
+		assert.equal(summary.gitContextMode, "linked-worktree");
+		assert.equal(summary.protocolComplete, true);
+		assert.equal(summary.terminalReason, mode === "allowed" ? "normal_exit" : "read_only_violation");
+		assert.equal(readFileSync(join(cwd, "fake-prime-output.txt"), "utf8"), "created by fake Prime\n");
+	}
+});
+
 test("default RPC uses task-parts for large prompts and seals artifacts", () => {
 	const cwd = createRepo();
 	const outDir = join(cwd, ".prime-delegate", "runs", "normal");
