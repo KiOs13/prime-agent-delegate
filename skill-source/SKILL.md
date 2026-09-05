@@ -81,14 +81,16 @@ missing `C:\tmp\...` path even when the code is correct.
 
 - Run acceptance commands with the Node runtime the tests were written for:
   tests with Windows probes under `node.exe`, pure source tests under `node`.
-- Before calling a focused-check failure a code defect, rerun it from an ext4
-  cwd (for example `/tmp/...`) or under `node.exe`, and compare against the
-  pristine HEAD test run from the same cwd.
-- A `C:\tmp\...ps1 not found` parser-probe error is an environment failure,
-  not a code failure; record it as an environment limitation in the outcome.
-- Cross-check worktree file mtimes against `run.startedAt`/`finishedAt` in
-  `summary.json`: edits after the run bypass `unauthorized_change` and must
-  be attributed manually before acceptance.
+- Before classifying a focused-check failure, compare the candidate with the
+  pre-change baseline under the same runtime and cwd. If needed, rerun both
+  from an ext4 cwd (for example `/tmp/...`) or under `node.exe`.
+- A `C:\tmp\...ps1 not found` parser-probe error alone does not prove an
+  environment failure; record it as an environment limitation only when the
+  controlled rerun and baseline comparison confirm that cause.
+- Cross-check worktree file mtimes against `startedAt`/`finishedAt` in
+  `summary.json` (`run.startedAt`/`run.finishedAt` in `audit-summary.json`):
+  edits after the run bypass `unauthorized_change` and must be attributed
+  manually before acceptance.
 
 ## Task context
 
