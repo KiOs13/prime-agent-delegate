@@ -72,6 +72,24 @@ overrides this location.
 12. Accept, fix, partially reuse, or reject the result. Commit only after Codex
     verification and user authorization.
 
+## Acceptance environment
+
+The delegated worktree lives on a Windows drive through WSL (`/mnt/c/...`).
+Windows processes launched from that cwd resolve WSL `/tmp` as `C:\tmp`, so a
+test that spawns `powershell.exe` with a file from `os.tmpdir()` fails with a
+missing `C:\tmp\...` path even when the code is correct.
+
+- Run acceptance commands with the Node runtime the tests were written for:
+  tests with Windows probes under `node.exe`, pure source tests under `node`.
+- Before calling a focused-check failure a code defect, rerun it from an ext4
+  cwd (for example `/tmp/...`) or under `node.exe`, and compare against the
+  pristine HEAD test run from the same cwd.
+- A `C:\tmp\...ps1 not found` parser-probe error is an environment failure,
+  not a code failure; record it as an environment limitation in the outcome.
+- Cross-check worktree file mtimes against `run.startedAt`/`finishedAt` in
+  `summary.json`: edits after the run bypass `unauthorized_change` and must
+  be attributed manually before acceptance.
+
 ## Task context
 
 Every unknown the worker must resolve by reading the repository costs model turns.

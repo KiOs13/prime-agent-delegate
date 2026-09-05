@@ -545,6 +545,9 @@ const readBatchingRules = options.noTools
 		"Batch reads in one tool call with a heredoc-free shell command per batch, for example:",
 		`sed -n '1,200p' file1.md && sed -n '300,420p' src/code.php && grep -n 'keyword' src/other.php`,
 	];
+const acceptanceEnvironmentRules = options.noTools
+	? []
+	: ["The worktree cwd is on a Windows drive (/mnt/c/...). Windows tools spawned from it resolve /tmp as C:\\tmp. If a focused check fails only with a missing C:\\tmp\\... temp file, rerun it from an ext4 cwd or with node.exe before treating it as a code failure."];
 const workerRulesBase = [
 	"You are a delegated coding worker. Work only in cwd.",
 	"Do not commit, push, deploy, alter credentials, or perform destructive cleanup.",
@@ -554,6 +557,7 @@ const workerRulesBase = [
 ...readBatchingRules,
 	"Reading budget: finish all exploration in at most 4 tool calls, keep every read batched, and never reread a file. Every tool call after the 4th must follow the first allowed edit.",
 	"Run only focused checks for the bounded change. Leave full integration and regression suites to Codex after this worker session exits.",
+	...acceptanceEnvironmentRules,
 	options.requireChange
 		? `The no-change watchdog kills this process after ${noChangeTimeoutMs} ms or ${noChangeMaxToolCalls} tool calls without a file change. Make the first allowed edit within the first 4 tool calls, before writing assertions.`
 		: "Do not edit unless the task explicitly requests it.",

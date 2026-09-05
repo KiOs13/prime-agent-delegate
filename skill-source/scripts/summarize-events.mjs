@@ -214,6 +214,7 @@ const audit = {
 		"Review this file and summary.json first; do not load events.jsonl into model context by default.",
 		"Check run.toolCallsBeforeFirstEdit and run.writeToolCalls against the reading budget: pre-edit exploration should stay within the worker prompt rules.",
 		"Independently inspect git diff and rerun required acceptance checks.",
+		"Cross-check worktree file mtimes against run.startedAt/finishedAt: post-run edits bypass the unauthorized_change gate and must be attributed manually.",
 		"Use targeted streaming filters on events.jsonl only when this summary shows a discrepancy.",
 	],
 };
